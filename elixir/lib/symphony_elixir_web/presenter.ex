@@ -241,16 +241,43 @@ defmodule SymphonyElixirWeb.Presenter do
       when is_integer(expires_at_ms) and expires_at_ms > now_ms and is_list(tasks) ->
         tasks
 
-      _cache_miss ->
-        tasks = WorkedTaskHistory.recent_tasks(limit: @max_worked_tasks)
-
-        :persistent_term.put(@worked_task_history_cache_key, %{
-          expires_at_ms: now_ms + @worked_task_history_cache_ttl_ms,
-          tasks: tasks
-        })
-
+      %{tasks: tasks, refreshing?: true} when is_list(tasks) ->
         tasks
+
+      %{tasks: tasks} when is_list(tasks) ->
+        start_history_cache_refresh(tasks)
+        tasks
+
+      _cache_miss ->
+        start_history_cache_refresh([])
+        []
     end
+  end
+
+  defp start_history_cache_refresh(stale_tasks) when is_list(stale_tasks) do
+    :persistent_term.put(@worked_task_history_cache_key, %{
+      expires_at_ms: 0,
+      refreshing?: true,
+      tasks: stale_tasks
+    })
+
+    Task.start(fn ->
+      tasks = load_default_historical_worked_tasks(stale_tasks)
+
+      :persistent_term.put(@worked_task_history_cache_key, %{
+        expires_at_ms: System.monotonic_time(:millisecond) + @worked_task_history_cache_ttl_ms,
+        refreshing?: false,
+        tasks: tasks
+      })
+    end)
+  end
+
+  defp load_default_historical_worked_tasks(stale_tasks) do
+    WorkedTaskHistory.recent_tasks(limit: @max_worked_tasks)
+  rescue
+    _error -> stale_tasks
+  catch
+    _kind, _reason -> stale_tasks
   end
 
   defp merge_worked_tasks(current_tasks, historical_tasks) do
