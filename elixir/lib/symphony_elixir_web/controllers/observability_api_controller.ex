@@ -24,6 +24,11 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
     end
   end
 
+  @spec decisions(Conn.t(), map()) :: Conn.t()
+  def decisions(conn, %{"session_id" => session_id} = params) do
+    json(conn, Presenter.decisions_payload(session_id, params))
+  end
+
   @spec refresh(Conn.t(), map()) :: Conn.t()
   def refresh(conn, _params) do
     case Presenter.refresh_payload(orchestrator()) do

@@ -84,7 +84,7 @@ defmodule SymphonyElixir.WorkedTaskHistoryTest do
                codex_input_tokens: 170,
                codex_output_tokens: 20,
                codex_total_tokens: 190,
-               decisions: decisions
+               decisions: []
              }
            ] =
              SymphonyElixir.WorkedTaskHistory.recent_tasks(
@@ -94,6 +94,12 @@ defmodule SymphonyElixir.WorkedTaskHistoryTest do
              )
 
     assert task_id =~ "issue-43:#{thread_id}:"
+
+    decisions =
+      SymphonyElixir.WorkedTaskHistory.decisions_for_session(second_session_id,
+        sessions_root: sessions_root,
+        max_session_files: 10
+      )
 
     assert Enum.map(decisions, & &1.summary) == [
              "Choosing a log-backed history source.",

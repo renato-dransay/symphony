@@ -47,6 +47,7 @@ defmodule SymphonyElixir.TestSupport do
           Application.delete_env(:symphony_elixir, :github_pr_watcher_signals)
           Application.delete_env(:symphony_elixir, :worked_task_history_enabled)
           Application.delete_env(:symphony_elixir, :worked_task_history_loader)
+          Application.delete_env(:symphony_elixir, :worked_task_decision_loader)
           File.rm_rf(workflow_root)
         end)
 

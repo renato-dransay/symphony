@@ -386,6 +386,12 @@ defmodule SymphonyElixir.ExtensionsTest do
   test "phoenix observability api preserves state, issue, and refresh responses" do
     snapshot = static_snapshot()
     orchestrator_name = Module.concat(__MODULE__, :ObservabilityApiOrchestrator)
+    parent = self()
+
+    Application.put_env(:symphony_elixir, :worked_task_decision_loader, fn session_id ->
+      send(parent, {:decision_loader_called, session_id})
+      static_decisions()
+    end)
 
     {:ok, _pid} =
       StaticOrchestrator.start_link(
@@ -403,6 +409,8 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     conn = get(build_conn(), "/api/v1/state")
     state_payload = json_response(conn, 200)
+    refute Enum.any?(state_payload["worked_tasks"]["items"], &Map.has_key?(&1, "decisions"))
+    refute_received {:decision_loader_called, _session_id}
 
     assert state_payload == %{
              "generated_at" => state_payload["generated_at"],
@@ -470,20 +478,7 @@ defmodule SymphonyElixir.ExtensionsTest do
                    "turn_count" => 2,
                    "last_event" => "turn_completed",
                    "last_message" => nil,
-                   "tokens" => %{"input_tokens" => 100, "output_tokens" => 25, "total_tokens" => 125},
-                   "decisions" => [
-                     %{
-                       "at" =>
-                         state_payload["worked_tasks"]["items"]
-                         |> Enum.at(0)
-                         |> get_in(["decisions"])
-                         |> List.first()
-                         |> Map.fetch!("at"),
-                       "event" => "notification",
-                       "method" => "codex/event/agent_reasoning",
-                       "summary" => "reasoning update: picked API boundary"
-                     }
-                   ]
+                   "tokens" => %{"input_tokens" => 100, "output_tokens" => 25, "total_tokens" => 125}
                  },
                  %{
                    "task_id" => "task-done-1",
@@ -501,8 +496,7 @@ defmodule SymphonyElixir.ExtensionsTest do
                    "turn_count" => 1,
                    "last_event" => "turn_completed",
                    "last_message" => nil,
-                   "tokens" => %{"input_tokens" => 40, "output_tokens" => 8, "total_tokens" => 48},
-                   "decisions" => []
+                   "tokens" => %{"input_tokens" => 40, "output_tokens" => 8, "total_tokens" => 48}
                  }
                ],
                "page" => 1,
@@ -580,6 +574,49 @@ defmodule SymphonyElixir.ExtensionsTest do
              }
            } = json_response(conn, 200)
 
+    conn = get(build_conn(), "/api/v1/decisions/thread-done-2?sort=asc")
+
+    assert json_response(conn, 200) == %{
+             "session_id" => "thread-done-2",
+             "query" => "",
+             "sort" => "asc",
+             "total" => 3,
+             "items" => [
+               %{
+                 "at" => "2026-06-18T10:00:00Z",
+                 "event" => "notification",
+                 "method" => "codex/event/agent_reasoning",
+                 "summary" => "oldest decision: picked API boundary"
+               },
+               %{
+                 "at" => "2026-06-18T10:01:00Z",
+                 "event" => "notification",
+                 "method" => "codex/event/agent_message",
+                 "summary" => "middle decision: kept review open"
+               },
+               %{
+                 "at" => "2026-06-18T10:02:00Z",
+                 "event" => "task_complete",
+                 "method" => "codex/session",
+                 "summary" => "newest decision: auto-fix CI"
+               }
+             ]
+           }
+
+    assert_received {:decision_loader_called, "thread-done-2"}
+
+    conn = get(build_conn(), "/api/v1/decisions/thread-done-2?q=boundary&sort=desc")
+
+    assert %{
+             "session_id" => "thread-done-2",
+             "query" => "boundary",
+             "sort" => "desc",
+             "total" => 1,
+             "items" => [%{"summary" => "oldest decision: picked API boundary"}]
+           } = json_response(conn, 200)
+
+    assert_received {:decision_loader_called, "thread-done-2"}
+
     conn = get(build_conn(), "/api/v1/state?page=2&page_size=1")
 
     assert %{
@@ -612,6 +649,9 @@ defmodule SymphonyElixir.ExtensionsTest do
              %{"error" => %{"code" => "method_not_allowed", "message" => "Method not allowed"}}
 
     assert json_response(get(build_conn(), "/api/v1/refresh"), 405) ==
+             %{"error" => %{"code" => "method_not_allowed", "message" => "Method not allowed"}}
+
+    assert json_response(post(build_conn(), "/api/v1/decisions/thread-done-2", %{}), 405) ==
              %{"error" => %{"code" => "method_not_allowed", "message" => "Method not allowed"}}
 
     assert json_response(post(build_conn(), "/", %{}), 405) ==
@@ -709,6 +749,17 @@ defmodule SymphonyElixir.ExtensionsTest do
   test "dashboard liveview renders and refreshes over pubsub" do
     orchestrator_name = Module.concat(__MODULE__, :DashboardOrchestrator)
     snapshot = static_snapshot()
+    parent = self()
+
+    Application.put_env(:symphony_elixir, :worked_task_decision_loader, fn
+      "thread-done-2" ->
+        send(parent, {:decision_loader_called, "thread-done-2"})
+        static_decisions()
+
+      session_id ->
+        send(parent, {:decision_loader_called, session_id})
+        []
+    end)
 
     {:ok, orchestrator_pid} =
       StaticOrchestrator.start_link(
@@ -740,12 +791,53 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "Offline"
     assert html =~ "Copy ID"
     assert html =~ "Codex update"
+    assert html =~ "See decisions"
+    refute html =~ "oldest decision: picked API boundary"
+    refute html =~ "newest decision: auto-fix CI"
+    refute_received {:decision_loader_called, _session_id}
     refute html =~ "data-runtime-clock="
     refute html =~ "setInterval(refreshRuntimeClocks"
     refute html =~ "Refresh now"
     refute html =~ "Transport"
     assert html =~ "status-badge-live"
     assert html =~ "status-badge-offline"
+
+    html =
+      view
+      |> element(~s(button[phx-click="show_decisions"][phx-value-task-id="task-done-2"]), "See decisions")
+      |> render_click()
+
+    assert_received {:decision_loader_called, "thread-done-2"}
+    assert html =~ "Decisions for MT-DONE-2"
+    assert html =~ "Showing 3 of 3 decisions"
+    assert html =~ "oldest decision: picked API boundary"
+    assert html =~ "middle decision: kept review open"
+    assert html =~ "newest decision: auto-fix CI"
+    assert_html_order(html, "newest decision: auto-fix CI", "oldest decision: picked API boundary")
+
+    html =
+      view
+      |> form(~s(form[phx-change="decision_filters"]), %{"query" => "boundary", "sort" => "asc"})
+      |> render_change()
+
+    assert html =~ "Showing 1 of 3 decisions"
+    assert html =~ "oldest decision: picked API boundary"
+    refute html =~ "middle decision: kept review open"
+    refute html =~ "newest decision: auto-fix CI"
+
+    html =
+      view
+      |> form(~s(form[phx-change="decision_filters"]), %{"query" => "", "sort" => "asc"})
+      |> render_change()
+
+    assert_html_order(html, "oldest decision: picked API boundary", "newest decision: auto-fix CI")
+
+    html =
+      view
+      |> element("button", "Close")
+      |> render_click()
+
+    refute html =~ "Decisions for MT-DONE-2"
 
     updated_snapshot =
       put_in(snapshot.running, [
@@ -982,6 +1074,42 @@ defmodule SymphonyElixir.ExtensionsTest do
       codex_totals: %{input_tokens: 4, output_tokens: 8, total_tokens: 12, seconds_running: 42.5},
       rate_limits: %{"primary" => %{"remaining" => 11}}
     }
+  end
+
+  defp static_decisions do
+    [
+      %{
+        at: decision_at!("2026-06-18T10:00:00Z"),
+        event: :notification,
+        method: "codex/event/agent_reasoning",
+        summary: "oldest decision: picked API boundary"
+      },
+      %{
+        at: decision_at!("2026-06-18T10:01:00Z"),
+        event: :notification,
+        method: "codex/event/agent_message",
+        summary: "middle decision: kept review open"
+      },
+      %{
+        at: decision_at!("2026-06-18T10:02:00Z"),
+        event: :task_complete,
+        method: "codex/session",
+        summary: "newest decision: auto-fix CI"
+      }
+    ]
+  end
+
+  defp decision_at!(iso8601) do
+    {:ok, datetime, 0} = DateTime.from_iso8601(iso8601)
+    datetime
+  end
+
+  defp assert_html_order(html, first, second) do
+    assert html =~ first
+    assert html =~ second
+    {first_index, _first_length} = :binary.match(html, first)
+    {second_index, _second_length} = :binary.match(html, second)
+    assert first_index < second_index
   end
 
   defp wait_for_bound_port do

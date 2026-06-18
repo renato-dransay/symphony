@@ -7,7 +7,6 @@ defmodule SymphonyElixir.WorkedTaskHistory do
 
   @default_limit 100
   @default_max_session_files 300
-  @max_decisions 20
 
   @session_started_re ~r/^(?<at>\S+) info: Codex session started for issue_id=(?<issue_id>\S+) issue_identifier=(?<identifier>\S+) session_id=(?<session_id>\S+)/
   @completed_run_re ~r/^(?<at>\S+) info: Completed agent run for issue_id=(?<issue_id>\S+) issue_identifier=(?<identifier>\S+) session_id=(?<session_id>\S+) workspace=(?<workspace>\S+) turn=(?<turn>\d+)\/(?<max_turns>\d+)/
@@ -28,13 +27,32 @@ defmodule SymphonyElixir.WorkedTaskHistory do
       |> read_log_events()
       |> group_events()
 
-    session_summaries = session_summaries(groups, sessions_root, max_session_files)
+    session_summaries = session_summaries(groups, sessions_root, max_session_files, false)
 
     groups
     |> Enum.map(&task_from_group(&1, session_summaries))
     |> Enum.reject(&is_nil/1)
     |> Enum.sort_by(&timestamp_sort_key(Map.get(&1, :completed_at)), :desc)
     |> Enum.take(limit)
+  end
+
+  @spec decisions_for_session(term(), keyword()) :: [map()]
+  def decisions_for_session(session_id, opts \\ []) do
+    if is_binary(session_id) do
+      sessions_root = Keyword.get(opts, :sessions_root, default_sessions_root())
+      max_session_files = Keyword.get(opts, :max_session_files, @default_max_session_files)
+      thread_id = thread_id(session_id)
+
+      sessions_root
+      |> session_files(max_session_files)
+      |> Enum.find(&(session_file_thread_id(&1) == thread_id))
+      |> case do
+        nil -> []
+        path -> path |> parse_session_file(thread_id, true) |> Map.get(:decisions, [])
+      end
+    else
+      []
+    end
   end
 
   defp configured_log_file do
@@ -162,7 +180,7 @@ defmodule SymphonyElixir.WorkedTaskHistory do
     "#{issue_id}:#{thread_id}:#{completed_part}"
   end
 
-  defp session_summaries(groups, sessions_root, max_session_files) do
+  defp session_summaries(groups, sessions_root, max_session_files, include_decisions?) do
     wanted_thread_ids =
       groups
       |> Enum.map(fn {thread_id, _events} -> thread_id end)
@@ -174,7 +192,7 @@ defmodule SymphonyElixir.WorkedTaskHistory do
       thread_id = session_file_thread_id(path)
 
       if MapSet.member?(wanted_thread_ids, thread_id) do
-        Map.put(summaries, thread_id, parse_session_file(path, thread_id))
+        Map.put(summaries, thread_id, parse_session_file(path, thread_id, include_decisions?))
       else
         summaries
       end
@@ -199,7 +217,7 @@ defmodule SymphonyElixir.WorkedTaskHistory do
     end
   end
 
-  defp parse_session_file(path, thread_id) do
+  defp parse_session_file(path, thread_id, include_decisions?) do
     initial_summary = %{
       thread_id: thread_id,
       tokens: %{},
@@ -213,17 +231,16 @@ defmodule SymphonyElixir.WorkedTaskHistory do
     if File.regular?(path) do
       path
       |> File.stream!()
-      |> Enum.reduce(initial_summary, &parse_session_line/2)
-      |> Map.update!(:decisions, &Enum.take(&1, -@max_decisions))
+      |> Enum.reduce(initial_summary, &parse_session_line(&1, &2, include_decisions?))
     else
       initial_summary
     end
   end
 
-  defp parse_session_line(line, summary) do
-    if String.contains?(line, ["\"type\":\"event_msg\"", "\"type\":\"turn_context\""]) do
+  defp parse_session_line(line, summary, include_decisions?) do
+    if relevant_session_line?(line, include_decisions?) do
       case Jason.decode(line) do
-        {:ok, %{} = json} -> parse_session_json(json, summary)
+        {:ok, %{} = json} -> parse_session_json(json, summary, include_decisions?)
         _ -> summary
       end
     else
@@ -231,40 +248,55 @@ defmodule SymphonyElixir.WorkedTaskHistory do
     end
   end
 
-  defp parse_session_json(%{"timestamp" => timestamp} = json, summary) do
+  defp relevant_session_line?(line, true) do
+    String.contains?(line, ["\"type\":\"event_msg\"", "\"type\":\"turn_context\""])
+  end
+
+  defp relevant_session_line?(line, false) do
+    String.contains?(line, [
+      "\"type\":\"turn_context\"",
+      "\"type\":\"token_count\"",
+      "\"type\":\"task_complete\""
+    ])
+  end
+
+  defp parse_session_json(%{"timestamp" => timestamp} = json, summary, include_decisions?) do
     timestamp = parse_datetime(timestamp)
 
     summary
     |> update_session_bounds(timestamp)
-    |> apply_session_payload(json, timestamp)
+    |> apply_session_payload(json, timestamp, include_decisions?)
   end
 
-  defp parse_session_json(_json, summary), do: summary
+  defp parse_session_json(_json, summary, _include_decisions?), do: summary
 
-  defp apply_session_payload(%{} = summary, %{"type" => "turn_context", "payload" => payload}, _timestamp)
+  defp apply_session_payload(%{} = summary, %{"type" => "turn_context", "payload" => payload}, _timestamp, _include_decisions?)
        when is_map(payload) do
     add_turn_id(summary, payload["turn_id"])
   end
 
-  defp apply_session_payload(%{} = summary, %{"type" => "event_msg", "payload" => %{"type" => "token_count"} = payload}, _timestamp) do
+  defp apply_session_payload(%{} = summary, %{"type" => "event_msg", "payload" => %{"type" => "token_count"} = payload}, _timestamp, _include_decisions?) do
     case get_in(payload, ["info", "total_token_usage"]) do
       %{} = usage -> Map.put(summary, :tokens, token_totals(usage))
       _ -> summary
     end
   end
 
-  defp apply_session_payload(%{} = summary, %{"type" => "event_msg", "payload" => %{"type" => "agent_message"} = payload}, timestamp) do
+  defp apply_session_payload(%{} = summary, %{"type" => "event_msg", "payload" => %{"type" => "agent_message"} = payload}, timestamp, true) do
     add_decision(summary, timestamp, :agent_message, payload["message"])
   end
 
-  defp apply_session_payload(%{} = summary, %{"type" => "event_msg", "payload" => %{"type" => "task_complete"} = payload}, timestamp) do
+  defp apply_session_payload(%{} = summary, %{"type" => "event_msg", "payload" => %{"type" => "task_complete"} = payload}, timestamp, include_decisions?) do
     summary
     |> add_turn_id(payload["turn_id"])
     |> add_duration_ms(payload["duration_ms"])
-    |> add_decision(timestamp, :task_complete, payload["last_agent_message"])
+    |> maybe_add_decision(timestamp, :task_complete, payload["last_agent_message"], include_decisions?)
   end
 
-  defp apply_session_payload(summary, _json, _timestamp), do: summary
+  defp apply_session_payload(summary, _json, _timestamp, _include_decisions?), do: summary
+
+  defp maybe_add_decision(summary, timestamp, event, message, true), do: add_decision(summary, timestamp, event, message)
+  defp maybe_add_decision(summary, _timestamp, _event, _message, false), do: summary
 
   defp update_session_bounds(summary, nil), do: summary
 
@@ -304,15 +336,7 @@ defmodule SymphonyElixir.WorkedTaskHistory do
 
   defp append_decision(summary, timestamp, event, decision_summary) do
     decision = %{at: timestamp, event: event, method: "codex/session", summary: decision_summary}
-    Map.update!(summary, :decisions, &append_unique_decision(&1, decision))
-  end
-
-  defp append_unique_decision(decisions, decision) do
-    if Enum.any?(decisions, &(Map.get(&1, :summary) == Map.get(decision, :summary))) do
-      decisions
-    else
-      decisions ++ [decision]
-    end
+    Map.update!(summary, :decisions, &(&1 ++ [decision]))
   end
 
   defp token_totals(usage) do

@@ -3,7 +3,7 @@ defmodule SymphonyElixirWeb.Presenter do
   Shared projections for the observability API and dashboard.
   """
 
-  alias SymphonyElixir.{Config, Orchestrator, StatusDashboard}
+  alias SymphonyElixir.{Config, Orchestrator, StatusDashboard, WorkedTaskHistory}
 
   @spec state_payload(GenServer.name(), timeout()) :: map()
   @spec state_payload(GenServer.name(), timeout(), keyword()) :: map()
@@ -64,6 +64,27 @@ defmodule SymphonyElixirWeb.Presenter do
       payload ->
         {:ok, Map.update!(payload, :requested_at, &DateTime.to_iso8601/1)}
     end
+  end
+
+  @spec decisions_payload(String.t(), map() | keyword()) :: map()
+  def decisions_payload(session_id, opts \\ []) do
+    query = option_value(opts, :query) || option_value(opts, :q) || ""
+    sort = sort_direction(option_value(opts, :sort))
+
+    decisions =
+      session_id
+      |> load_decisions()
+      |> search_decisions(query)
+      |> sort_decisions(sort)
+      |> Enum.map(&decision_payload/1)
+
+    %{
+      session_id: session_id,
+      query: query,
+      sort: Atom.to_string(sort),
+      total: length(decisions),
+      items: decisions
+    }
   end
 
   defp issue_payload_body(issue_identifier, running, retry, blocked, worked_task) do
@@ -201,11 +222,7 @@ defmodule SymphonyElixirWeb.Presenter do
         input_tokens: Map.get(task, :codex_input_tokens, 0),
         output_tokens: Map.get(task, :codex_output_tokens, 0),
         total_tokens: Map.get(task, :codex_total_tokens, 0)
-      },
-      decisions:
-        task
-        |> Map.get(:decisions, [])
-        |> Enum.map(&decision_payload/1)
+      }
     }
   end
 
@@ -219,6 +236,72 @@ defmodule SymphonyElixirWeb.Presenter do
   end
 
   defp decision_payload(other), do: %{at: nil, event: nil, method: nil, summary: to_string(other)}
+
+  defp load_decisions(session_id) when is_binary(session_id) do
+    case Application.get_env(:symphony_elixir, :worked_task_decision_loader) do
+      loader when is_function(loader, 1) -> loader.(session_id)
+      loader when is_function(loader, 2) -> loader.(session_id, [])
+      {module, function} -> apply(module, function, [session_id, []])
+      _loader -> WorkedTaskHistory.decisions_for_session(session_id)
+    end
+  end
+
+  defp load_decisions(_session_id), do: []
+
+  defp search_decisions(decisions, query) do
+    query = query |> to_string() |> String.trim() |> String.downcase()
+
+    if query == "" do
+      decisions
+    else
+      Enum.filter(decisions, fn decision ->
+        decision
+        |> decision_search_text()
+        |> String.downcase()
+        |> String.contains?(query)
+      end)
+    end
+  end
+
+  defp decision_search_text(decision) when is_map(decision) do
+    [
+      Map.get(decision, :summary),
+      Map.get(decision, :method),
+      Map.get(decision, :event),
+      Map.get(decision, :at)
+    ]
+    |> Enum.map_join(" ", &search_part/1)
+  end
+
+  defp decision_search_text(decision), do: to_string(decision)
+
+  defp search_part(%DateTime{} = datetime), do: DateTime.to_iso8601(datetime)
+  defp search_part(value) when is_atom(value), do: Atom.to_string(value)
+  defp search_part(value) when is_binary(value), do: value
+  defp search_part(value) when is_integer(value), do: Integer.to_string(value)
+  defp search_part(_value), do: ""
+
+  defp sort_decisions(decisions, :asc), do: Enum.sort_by(decisions, &decision_sort_key/1, :asc)
+  defp sort_decisions(decisions, :desc), do: Enum.sort_by(decisions, &decision_sort_key/1, :desc)
+
+  defp decision_sort_key(decision) when is_map(decision) do
+    case Map.get(decision, :at) do
+      %DateTime{} = datetime -> DateTime.to_unix(datetime, :microsecond)
+      _datetime -> 0
+    end
+  end
+
+  defp decision_sort_key(_decision), do: 0
+
+  defp sort_direction(value) when is_binary(value) do
+    case String.downcase(String.trim(value)) do
+      "asc" -> :asc
+      _other -> :desc
+    end
+  end
+
+  defp sort_direction(:asc), do: :asc
+  defp sort_direction(_value), do: :desc
 
   defp running_issue_payload(running) do
     %{
@@ -310,6 +393,10 @@ defmodule SymphonyElixirWeb.Presenter do
   end
 
   defp iso8601(_datetime), do: nil
+
+  defp option_value(opts, key) when is_list(opts), do: Keyword.get(opts, key)
+  defp option_value(opts, key) when is_map(opts), do: Map.get(opts, Atom.to_string(key)) || Map.get(opts, key)
+  defp option_value(_opts, _key), do: nil
 
   defp positive_int(value, _default) when is_integer(value) and value > 0, do: value
 
