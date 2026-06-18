@@ -5,6 +5,10 @@ defmodule SymphonyElixirWeb.Presenter do
 
   alias SymphonyElixir.{Config, Orchestrator, StatusDashboard, WorkedTaskHistory}
 
+  @max_worked_tasks 100
+  @worked_task_history_cache_key {__MODULE__, :worked_task_history}
+  @worked_task_history_cache_ttl_ms 10_000
+
   @spec state_payload(GenServer.name(), timeout()) :: map()
   @spec state_payload(GenServer.name(), timeout(), keyword()) :: map()
   def state_payload(orchestrator, snapshot_timeout_ms, opts \\ []) do
@@ -12,6 +16,8 @@ defmodule SymphonyElixirWeb.Presenter do
 
     case Orchestrator.snapshot(orchestrator, snapshot_timeout_ms) do
       %{} = snapshot ->
+        worked_tasks = visible_worked_tasks(Map.get(snapshot, :worked_tasks, []))
+
         %{
           generated_at: generated_at,
           counts: %{
@@ -22,7 +28,7 @@ defmodule SymphonyElixirWeb.Presenter do
           running: Enum.map(snapshot.running, &running_entry_payload/1),
           retrying: Enum.map(snapshot.retrying, &retry_entry_payload/1),
           blocked: Enum.map(Map.get(snapshot, :blocked, []), &blocked_entry_payload/1),
-          worked_tasks: worked_tasks_payload(Map.get(snapshot, :worked_tasks, []), opts),
+          worked_tasks: worked_tasks_payload(worked_tasks, opts),
           codex_totals: snapshot.codex_totals,
           rate_limits: snapshot.rate_limits
         }
@@ -42,7 +48,7 @@ defmodule SymphonyElixirWeb.Presenter do
         running = Enum.find(snapshot.running, &(&1.identifier == issue_identifier))
         retry = Enum.find(snapshot.retrying, &(&1.identifier == issue_identifier))
         blocked = Enum.find(Map.get(snapshot, :blocked, []), &(&1.identifier == issue_identifier))
-        worked_task = Enum.find(Map.get(snapshot, :worked_tasks, []), &(&1.identifier == issue_identifier))
+        worked_task = Enum.find(visible_worked_tasks(Map.get(snapshot, :worked_tasks, [])), &(&1.identifier == issue_identifier))
 
         if is_nil(running) and is_nil(retry) and is_nil(blocked) and is_nil(worked_task) do
           {:error, :issue_not_found}
@@ -200,6 +206,69 @@ defmodule SymphonyElixirWeb.Presenter do
   end
 
   defp worked_tasks_payload(_tasks, opts), do: worked_tasks_payload([], opts)
+
+  defp visible_worked_tasks(current_tasks) do
+    case historical_worked_tasks() do
+      [] ->
+        current_tasks
+        |> Enum.reject(&is_nil/1)
+        |> Enum.take(@max_worked_tasks)
+
+      historical_tasks ->
+        current_tasks
+        |> merge_worked_tasks(historical_tasks)
+        |> Enum.take(@max_worked_tasks)
+    end
+  end
+
+  defp historical_worked_tasks do
+    if Application.get_env(:symphony_elixir, :worked_task_history_enabled, true) do
+      case Application.get_env(:symphony_elixir, :worked_task_history_loader) do
+        loader when is_function(loader, 1) -> loader.(limit: @max_worked_tasks)
+        {module, function} -> apply(module, function, [[limit: @max_worked_tasks]])
+        _loader -> cached_default_historical_worked_tasks()
+      end
+    else
+      []
+    end
+  end
+
+  defp cached_default_historical_worked_tasks do
+    now_ms = System.monotonic_time(:millisecond)
+
+    case :persistent_term.get(@worked_task_history_cache_key, nil) do
+      %{expires_at_ms: expires_at_ms, tasks: tasks}
+      when is_integer(expires_at_ms) and expires_at_ms > now_ms and is_list(tasks) ->
+        tasks
+
+      _cache_miss ->
+        tasks = WorkedTaskHistory.recent_tasks(limit: @max_worked_tasks)
+
+        :persistent_term.put(@worked_task_history_cache_key, %{
+          expires_at_ms: now_ms + @worked_task_history_cache_ttl_ms,
+          tasks: tasks
+        })
+
+        tasks
+    end
+  end
+
+  defp merge_worked_tasks(current_tasks, historical_tasks) do
+    current_tasks
+    |> Kernel.++(historical_tasks)
+    |> Enum.reject(&is_nil/1)
+    |> Enum.uniq_by(&Map.get(&1, :task_id))
+    |> Enum.with_index()
+    |> Enum.sort_by(fn {task, index} -> {worked_task_completed_sort_key(task), -index} end, :desc)
+    |> Enum.map(&elem(&1, 0))
+  end
+
+  defp worked_task_completed_sort_key(task) do
+    case Map.get(task, :completed_at) do
+      %DateTime{} = datetime -> DateTime.to_unix(datetime, :microsecond)
+      _datetime -> 0
+    end
+  end
 
   defp worked_task_payload(task) do
     %{

@@ -625,7 +625,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
   end
 
   defp snapshot_timeout_ms do
-    Endpoint.config(:snapshot_timeout_ms) || 15_000
+    Endpoint.config(:snapshot_timeout_ms) || 2_000
   end
 
   attr(:identifier, :string, required: true)

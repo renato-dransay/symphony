@@ -102,6 +102,95 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
            }
   end
 
+  test "orchestrator stores stream deltas lightly and throttles dashboard notifications" do
+    issue_id = "issue-stream-delta"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-189",
+      title: "Stream delta test",
+      description: "Keep stream updates cheap",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-189"
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :StreamDeltaOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+    future_notify_ms = System.monotonic_time(:millisecond) + 60_000
+
+    running_entry = %{
+      pid: self(),
+      ref: make_ref(),
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: "thread-stream-turn-stream",
+      turn_count: 1,
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      started_at: DateTime.utc_now()
+    }
+
+    state_with_issue =
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+      |> Map.put(:last_dashboard_notify_at_ms, future_notify_ms)
+
+    :sys.replace_state(pid, fn _ -> state_with_issue end)
+
+    now = DateTime.utc_now()
+
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       %{
+         event: :notification,
+         payload: %{"method" => "item/agentMessage/delta", "params" => %{"delta" => "hello"}},
+         raw: String.duplicate("x", 1_000),
+         timestamp: now
+       }}
+    )
+
+    state_after_delta = :sys.get_state(pid)
+    running_after_delta = Map.fetch!(state_after_delta.running, issue_id)
+
+    assert state_after_delta.last_dashboard_notify_at_ms == future_notify_ms
+    assert running_after_delta.last_codex_timestamp == now
+
+    assert running_after_delta.last_codex_message == %{
+             event: :notification,
+             message: %{
+               "method" => "item/agentMessage/delta",
+               "params" => %{"delta" => "hello"}
+             },
+             timestamp: now
+           }
+
+    refute inspect(running_after_delta.last_codex_message) =~ String.duplicate("x", 100)
+
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       %{
+         event: :notification,
+         payload: %{"method" => "turn/completed"},
+         timestamp: DateTime.utc_now()
+       }}
+    )
+
+    state_after_completed = :sys.get_state(pid)
+    refute state_after_completed.last_dashboard_notify_at_ms == future_notify_ms
+  end
+
   test "orchestrator snapshot tracks codex thread totals and app-server pid" do
     issue_id = "issue-usage-snapshot"
 
@@ -243,12 +332,14 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert worked_task.codex_total_tokens == 16
   end
 
-  test "orchestrator snapshot includes historical worked tasks" do
+  test "orchestrator snapshot does not load historical worked tasks in the GenServer" do
     completed_at = DateTime.utc_now()
+    parent = self()
 
     Application.put_env(:symphony_elixir, :worked_task_history_enabled, true)
 
     Application.put_env(:symphony_elixir, :worked_task_history_loader, fn opts ->
+      send(parent, {:history_loader_called, opts})
       assert opts == [limit: 100]
 
       [
@@ -287,8 +378,8 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       end
     end)
 
-    assert %{worked_tasks: [%{task_id: "historical-task", codex_total_tokens: 45}]} =
-             GenServer.call(pid, :snapshot)
+    assert %{worked_tasks: []} = GenServer.call(pid, :snapshot)
+    refute_received {:history_loader_called, _opts}
   end
 
   test "orchestrator snapshot tracks turn completed usage when present" do

@@ -7,6 +7,7 @@ defmodule SymphonyElixir.HttpServer do
   alias SymphonyElixirWeb.Endpoint
 
   @secret_key_bytes 48
+  @default_snapshot_timeout_ms 2_000
 
   @spec child_spec(keyword()) :: Supervisor.child_spec()
   def child_spec(opts) do
@@ -22,7 +23,7 @@ defmodule SymphonyElixir.HttpServer do
       port when is_integer(port) and port >= 0 ->
         host = Keyword.get(opts, :host, Config.settings!().server.host)
         orchestrator = Keyword.get(opts, :orchestrator, Orchestrator)
-        snapshot_timeout_ms = Keyword.get(opts, :snapshot_timeout_ms, 15_000)
+        snapshot_timeout_ms = Keyword.get(opts, :snapshot_timeout_ms, @default_snapshot_timeout_ms)
 
         with {:ok, ip} <- parse_host(host) do
           endpoint_opts = [

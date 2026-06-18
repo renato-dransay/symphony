@@ -63,7 +63,7 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
   end
 
   defp snapshot_timeout_ms do
-    Endpoint.config(:snapshot_timeout_ms) || 15_000
+    Endpoint.config(:snapshot_timeout_ms) || 2_000
   end
 
   defp worked_task_options(params) when is_map(params) do

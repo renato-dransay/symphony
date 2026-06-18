@@ -641,6 +641,77 @@ defmodule SymphonyElixir.ExtensionsTest do
              json_response(conn, 202)
   end
 
+  test "phoenix observability api merges historical worked tasks outside orchestrator snapshot" do
+    completed_at = DateTime.utc_now()
+    parent = self()
+
+    Application.put_env(:symphony_elixir, :worked_task_history_enabled, true)
+
+    Application.put_env(:symphony_elixir, :worked_task_history_loader, fn opts ->
+      send(parent, {:history_loader_called, opts})
+
+      [
+        %{
+          task_id: "historical-task",
+          issue_id: "issue-history",
+          identifier: "MT-HIST",
+          title: "Historical task",
+          issue_url: "https://example.org/issues/MT-HIST",
+          state: "Done",
+          session_id: "thread-history-turn-history",
+          worker_host: "dm-dev2",
+          workspace_path: "/workspaces/MT-HIST",
+          started_at: DateTime.add(completed_at, -120, :second),
+          completed_at: completed_at,
+          duration_seconds: 120,
+          turn_count: 2,
+          codex_input_tokens: 40,
+          codex_output_tokens: 5,
+          codex_total_tokens: 45,
+          last_codex_event: :historical_session,
+          last_codex_message: nil,
+          decisions: []
+        }
+      ]
+    end)
+
+    snapshot = static_snapshot() |> Map.put(:worked_tasks, [])
+    orchestrator_name = Module.concat(__MODULE__, :HistoricalObservabilityApiOrchestrator)
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: snapshot,
+        refresh: :unavailable
+      )
+
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+
+    conn = get(build_conn(), "/api/v1/state")
+
+    assert %{
+             "worked_tasks" => %{
+               "total" => 1,
+               "items" => [%{"issue_identifier" => "MT-HIST", "tokens" => %{"total_tokens" => 45}}]
+             }
+           } = json_response(conn, 200)
+
+    assert_received {:history_loader_called, [limit: 100]}
+
+    conn = get(build_conn(), "/api/v1/MT-HIST")
+
+    assert %{
+             "status" => "worked",
+             "worked_task" => %{
+               "issue_identifier" => "MT-HIST",
+               "duration_seconds" => 120,
+               "tokens" => %{"total_tokens" => 45}
+             }
+           } = json_response(conn, 200)
+
+    assert_received {:history_loader_called, [limit: 100]}
+  end
+
   test "phoenix observability api preserves 405, 404, and unavailable behavior" do
     unavailable_orchestrator = Module.concat(__MODULE__, :UnavailableOrchestrator)
     start_test_endpoint(orchestrator: unavailable_orchestrator, snapshot_timeout_ms: 5)

@@ -7,7 +7,7 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, WorkedTaskHistory, Workspace}
+  alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
   alias SymphonyElixir.GitHub.PrWatcher
   alias SymphonyElixir.Linear.Issue
 
@@ -16,6 +16,8 @@ defmodule SymphonyElixir.Orchestrator do
   @in_progress_state "In Progress"
   @max_worked_tasks 100
   @max_task_decisions 20
+  @dashboard_notify_min_interval_ms 1_000
+  @request_refresh_timeout_ms 2_000
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
   @empty_codex_totals %{
@@ -47,6 +49,7 @@ defmodule SymphonyElixir.Orchestrator do
       retry_attempts: %{},
       codex_totals: nil,
       codex_rate_limits: nil,
+      last_dashboard_notify_at_ms: nil,
       github_pr_signal_fingerprints: %{}
     ]
   end
@@ -179,9 +182,10 @@ defmodule SymphonyElixir.Orchestrator do
           state
           |> apply_codex_token_delta(token_delta)
           |> apply_codex_rate_limits(update)
+          |> Map.put(:running, Map.put(running, issue_id, updated_running_entry))
+          |> maybe_notify_dashboard_for_codex_update(update)
 
-        notify_dashboard()
-        {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
+        {:noreply, state}
     end
   end
 
@@ -1403,7 +1407,12 @@ defmodule SymphonyElixir.Orchestrator do
   @spec request_refresh(GenServer.server()) :: map() | :unavailable
   def request_refresh(server) do
     if Process.whereis(server) do
-      GenServer.call(server, :request_refresh)
+      try do
+        GenServer.call(server, :request_refresh, @request_refresh_timeout_ms)
+      catch
+        :exit, {:timeout, _} -> :unavailable
+        :exit, _ -> :unavailable
+      end
     else
       :unavailable
     end
@@ -1531,35 +1540,8 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp snapshot_worked_tasks(%State{worked_tasks: worked_tasks}) do
     worked_tasks
-    |> merge_worked_tasks(historical_worked_tasks())
-    |> Enum.take(@max_worked_tasks)
-  end
-
-  defp historical_worked_tasks do
-    if Application.get_env(:symphony_elixir, :worked_task_history_enabled, true) do
-      case Application.get_env(:symphony_elixir, :worked_task_history_loader) do
-        loader when is_function(loader, 1) -> loader.(limit: @max_worked_tasks)
-        {module, function} -> apply(module, function, [[limit: @max_worked_tasks]])
-        _loader -> WorkedTaskHistory.recent_tasks(limit: @max_worked_tasks)
-      end
-    else
-      []
-    end
-  end
-
-  defp merge_worked_tasks(current_tasks, historical_tasks) do
-    current_tasks
-    |> Kernel.++(historical_tasks)
     |> Enum.reject(&is_nil/1)
-    |> Enum.uniq_by(&Map.get(&1, :task_id))
-    |> Enum.sort_by(&worked_task_completed_sort_key/1, :desc)
-  end
-
-  defp worked_task_completed_sort_key(task) do
-    case Map.get(task, :completed_at) do
-      %DateTime{} = datetime -> DateTime.to_unix(datetime, :microsecond)
-      _datetime -> 0
-    end
+    |> Enum.take(@max_worked_tasks)
   end
 
   defp integrate_codex_update(running_entry, %{event: event, timestamp: timestamp} = update) do
@@ -1633,10 +1615,124 @@ defmodule SymphonyElixir.Orchestrator do
   defp summarize_codex_update(update) do
     %{
       event: update[:event],
-      message: update[:payload] || update[:raw],
+      message: codex_update_message(update),
       timestamp: update[:timestamp]
     }
   end
+
+  defp codex_update_message(update) do
+    if codex_stream_delta_update?(update) do
+      lightweight_codex_delta_message(update)
+    else
+      update[:payload] || update[:raw]
+    end
+  end
+
+  defp lightweight_codex_delta_message(update) do
+    payload = update[:payload] || update[:raw] || %{}
+    method = codex_update_method(update)
+
+    if is_binary(method) do
+      %{
+        "method" => method,
+        "params" => lightweight_delta_params(method, payload)
+      }
+    else
+      payload
+    end
+  end
+
+  defp lightweight_delta_params(method, payload) do
+    case stream_delta_value(payload) do
+      nil -> %{}
+      value -> %{delta_param_key(method) => truncate_delta_value(value)}
+    end
+  end
+
+  defp delta_param_key(method) when is_binary(method) do
+    cond do
+      String.contains?(method, "outputDelta") -> "outputDelta"
+      String.contains?(method, "textDelta") -> "textDelta"
+      String.contains?(method, "summaryTextDelta") -> "summaryText"
+      true -> "delta"
+    end
+  end
+
+  defp stream_delta_value(payload) do
+    Enum.find_value(
+      [
+        ["params", "delta"],
+        [:params, :delta],
+        ["params", "outputDelta"],
+        [:params, :outputDelta],
+        ["params", "textDelta"],
+        [:params, :textDelta],
+        ["params", "summaryText"],
+        [:params, :summaryText],
+        ["params", "msg", "delta"],
+        [:params, :msg, :delta],
+        ["params", "msg", "outputDelta"],
+        [:params, :msg, :outputDelta],
+        ["params", "msg", "payload", "delta"],
+        [:params, :msg, :payload, :delta],
+        ["params", "msg", "payload", "outputDelta"],
+        [:params, :msg, :payload, :outputDelta],
+        ["params", "msg", "content"],
+        [:params, :msg, :content]
+      ],
+      &map_path(payload, &1)
+    )
+  end
+
+  defp truncate_delta_value(value) when is_binary(value) do
+    value
+    |> String.replace(~r/\s+/, " ")
+    |> String.slice(0, 160)
+  end
+
+  defp truncate_delta_value(value) do
+    value
+    |> inspect(limit: 4, printable_limit: 160)
+    |> String.slice(0, 160)
+  end
+
+  defp maybe_notify_dashboard_for_codex_update(%State{} = state, update) do
+    now_ms = System.monotonic_time(:millisecond)
+
+    if immediate_dashboard_update?(update) or dashboard_notify_due?(state, now_ms) do
+      notify_dashboard()
+      %{state | last_dashboard_notify_at_ms: now_ms}
+    else
+      state
+    end
+  end
+
+  defp immediate_dashboard_update?(update), do: not codex_stream_delta_update?(update)
+
+  defp dashboard_notify_due?(%State{last_dashboard_notify_at_ms: nil}, _now_ms), do: true
+
+  defp dashboard_notify_due?(%State{last_dashboard_notify_at_ms: last_notify_ms}, now_ms)
+       when is_integer(last_notify_ms) do
+    now_ms - last_notify_ms >= @dashboard_notify_min_interval_ms
+  end
+
+  defp dashboard_notify_due?(_state, _now_ms), do: true
+
+  defp codex_stream_delta_update?(update) when is_map(update) do
+    update
+    |> codex_update_method()
+    |> codex_stream_delta_method?()
+  end
+
+  defp codex_stream_delta_update?(_update), do: false
+
+  defp codex_stream_delta_method?(method) when is_binary(method) do
+    String.ends_with?(method, "/delta") or
+      String.ends_with?(method, "Delta") or
+      String.ends_with?(method, "_delta")
+  end
+
+  defp codex_stream_delta_method?(_method), do: false
 
   defp schedule_tick(%State{} = state, delay_ms) when is_integer(delay_ms) and delay_ms >= 0 do
     if is_reference(state.tick_timer_ref) do

@@ -517,11 +517,28 @@ defmodule SymphonyElixir.Codex.AppServer do
             metadata
           )
 
-          Logger.debug("Codex notification: #{inspect(method)}")
+          if log_codex_notification?(method) do
+            Logger.debug("Codex notification: #{inspect(method)}")
+          end
+
           receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
         end
     end
   end
+
+  defp log_codex_notification?(method) when is_binary(method) do
+    not codex_stream_delta_method?(method)
+  end
+
+  defp log_codex_notification?(_method), do: true
+
+  defp codex_stream_delta_method?(method) when is_binary(method) do
+    String.ends_with?(method, "/delta") or
+      String.ends_with?(method, "Delta") or
+      String.ends_with?(method, "_delta")
+  end
+
+  defp codex_stream_delta_method?(_method), do: false
 
   defp maybe_handle_approval_request(
          port,
