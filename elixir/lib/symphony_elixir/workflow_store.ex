@@ -9,6 +9,7 @@ defmodule SymphonyElixir.WorkflowStore do
   alias SymphonyElixir.Workflow
 
   @poll_interval_ms 1_000
+  @default_call_timeout_ms 1_000
 
   defmodule State do
     @moduledoc false
@@ -25,7 +26,7 @@ defmodule SymphonyElixir.WorkflowStore do
   def current do
     case Process.whereis(__MODULE__) do
       pid when is_pid(pid) ->
-        GenServer.call(__MODULE__, :current)
+        call_current_or_load_directly()
 
       _ ->
         Workflow.load()
@@ -36,7 +37,7 @@ defmodule SymphonyElixir.WorkflowStore do
   def force_reload do
     case Process.whereis(__MODULE__) do
       pid when is_pid(pid) ->
-        GenServer.call(__MODULE__, :force_reload)
+        call_force_reload_or_load_directly()
 
       _ ->
         case Workflow.load() do
@@ -44,6 +45,30 @@ defmodule SymphonyElixir.WorkflowStore do
           {:error, reason} -> {:error, reason}
         end
     end
+  end
+
+  defp call_current_or_load_directly do
+    GenServer.call(__MODULE__, :current, call_timeout_ms())
+  catch
+    :exit, reason ->
+      Logger.warning("WorkflowStore current call failed; loading workflow directly reason=#{inspect(reason)}")
+      Workflow.load()
+  end
+
+  defp call_force_reload_or_load_directly do
+    GenServer.call(__MODULE__, :force_reload, call_timeout_ms())
+  catch
+    :exit, reason ->
+      Logger.warning("WorkflowStore force_reload call failed; loading workflow directly reason=#{inspect(reason)}")
+
+      case Workflow.load() do
+        {:ok, _workflow} -> :ok
+        {:error, reason} -> {:error, reason}
+      end
+  end
+
+  defp call_timeout_ms do
+    Application.get_env(:symphony_elixir, :workflow_store_call_timeout_ms, @default_call_timeout_ms)
   end
 
   @impl true

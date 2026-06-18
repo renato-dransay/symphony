@@ -354,7 +354,22 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
         ]
       },
       "createdAt" => "2026-01-01T00:00:00Z",
-      "updatedAt" => "2026-01-02T00:00:00Z"
+      "updatedAt" => "2026-01-02T00:00:00Z",
+      "attachments" => %{
+        "nodes" => [
+          %{"title" => "PR", "url" => "https://github.com/openai/symphony/pull/71"}
+        ]
+      },
+      "comments" => %{
+        "nodes" => [
+          %{
+            "body" => "CI is failing",
+            "createdAt" => "2026-01-03T00:00:00Z",
+            "updatedAt" => "2026-01-03T01:00:00Z",
+            "user" => %{"id" => "user-1", "name" => "Renato", "displayName" => "Renato Beltrao"}
+          }
+        ]
+      }
     }
 
     issue = Client.normalize_issue_for_test(raw_issue, "user-1")
@@ -365,6 +380,8 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert issue.state == "Todo"
     assert issue.assignee_id == "user-1"
     assert issue.assigned_to_worker
+    assert issue.attachments == [%{title: "PR", url: "https://github.com/openai/symphony/pull/71"}]
+    assert [%{body: "CI is failing", user: %{id: "user-1"}}] = issue.comments
   end
 
   test "linear client marks explicitly unassigned issues as not routed to worker" do
@@ -435,10 +452,25 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
     assert Enum.map(issues, & &1.id) == issue_ids
 
-    assert_receive {:fetch_issue_states_page, query, %{ids: ^first_batch_ids, first: 50, relationFirst: 50}}
+    assert_receive {:fetch_issue_states_page, query,
+                    %{
+                      ids: ^first_batch_ids,
+                      first: 50,
+                      relationFirst: 50,
+                      attachmentFirst: 50,
+                      commentFirst: 50
+                    }}
+
     assert query =~ "SymphonyLinearIssuesById"
 
-    assert_receive {:fetch_issue_states_page, ^query, %{ids: ^second_batch_ids, first: 5, relationFirst: 50}}
+    assert_receive {:fetch_issue_states_page, ^query,
+                    %{
+                      ids: ^second_batch_ids,
+                      first: 5,
+                      relationFirst: 50,
+                      attachmentFirst: 50,
+                      commentFirst: 50
+                    }}
   end
 
   test "linear client logs response bodies for non-200 graphql responses" do
@@ -593,6 +625,36 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     }
 
     assert Orchestrator.should_dispatch_issue_for_test(issue, state)
+  end
+
+  test "dispatch preparation moves todo issue to in progress" do
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+
+    issue = %Issue{
+      id: "start-1",
+      identifier: "MT-1010",
+      title: "Start this work",
+      state: "Todo"
+    }
+
+    assert %{state: "In Progress"} = Orchestrator.mark_issue_in_progress_for_test(issue)
+    assert_receive {:memory_tracker_state_update, "start-1", "In Progress"}
+  end
+
+  test "dispatch preparation leaves active issue state unchanged" do
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+
+    issue = %Issue{
+      id: "active-1",
+      identifier: "MT-1011",
+      title: "Already active",
+      state: "In Progress"
+    }
+
+    assert ^issue = Orchestrator.mark_issue_in_progress_for_test(issue)
+    refute_receive {:memory_tracker_state_update, _, _}, 50
   end
 
   test "dispatch revalidation skips stale todo issue once a non-terminal blocker appears" do

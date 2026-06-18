@@ -26,6 +26,7 @@ defmodule SymphonyElixir.MixProject do
           SymphonyElixir.StatusDashboard,
           SymphonyElixir.LogFile,
           SymphonyElixir.Workspace,
+          SymphonyElixir.WorkedTaskHistory,
           SymphonyElixirWeb.DashboardLive,
           SymphonyElixirWeb.Endpoint,
           SymphonyElixirWeb.ErrorHTML,

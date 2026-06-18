@@ -127,6 +127,70 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert {:ok, _pid} = Supervisor.restart_child(SymphonyElixir.Supervisor, WorkflowStore)
   end
 
+  test "workflow store falls back to direct load when cache process is unresponsive" do
+    previous_timeout = Application.get_env(:symphony_elixir, :workflow_store_call_timeout_ms)
+
+    on_exit(fn ->
+      if is_nil(previous_timeout) do
+        Application.delete_env(:symphony_elixir, :workflow_store_call_timeout_ms)
+      else
+        Application.put_env(:symphony_elixir, :workflow_store_call_timeout_ms, previous_timeout)
+      end
+    end)
+
+    Application.put_env(:symphony_elixir, :workflow_store_call_timeout_ms, 10)
+
+    write_workflow_file!(
+      Workflow.workflow_file_path(),
+      prompt: "Direct fallback prompt",
+      tracker_kind: "memory"
+    )
+
+    assert :ok = Supervisor.terminate_child(SymphonyElixir.Supervisor, WorkflowStore)
+
+    parent = self()
+
+    fake_store =
+      spawn(fn ->
+        Process.register(self(), WorkflowStore)
+        send(parent, :fake_workflow_store_ready)
+
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    on_exit(fn ->
+      if Process.alive?(fake_store) do
+        send(fake_store, :stop)
+      end
+
+      case Supervisor.restart_child(SymphonyElixir.Supervisor, WorkflowStore) do
+        {:ok, _pid} -> :ok
+        {:error, {:already_started, _pid}} -> :ok
+        {:error, :already_present} -> :ok
+        _ -> :ok
+      end
+    end)
+
+    assert_receive :fake_workflow_store_ready, 1_000
+
+    log =
+      capture_log(fn ->
+        assert {:ok, %{prompt: "Direct fallback prompt"}} = WorkflowStore.current()
+        assert Config.settings!().tracker.kind == "memory"
+        assert :ok = WorkflowStore.force_reload()
+
+        missing_path = Path.join(Path.dirname(Workflow.workflow_file_path()), "MISSING_FALLBACK_WORKFLOW.md")
+        Workflow.set_workflow_file_path(missing_path)
+
+        assert {:error, {:missing_workflow_file, ^missing_path, :enoent}} = WorkflowStore.force_reload()
+      end)
+
+    assert log =~ "WorkflowStore current call failed"
+    assert log =~ "WorkflowStore force_reload call failed"
+  end
+
   test "workflow store init stops on missing workflow file" do
     missing_path = Path.join(Path.dirname(Workflow.workflow_file_path()), "MISSING_WORKFLOW.md")
     Workflow.set_workflow_file_path(missing_path)
@@ -388,6 +452,64 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "last_event_at" => state_payload["blocked"] |> List.first() |> Map.fetch!("last_event_at")
                }
              ],
+             "worked_tasks" => %{
+               "items" => [
+                 %{
+                   "task_id" => "task-done-2",
+                   "issue_id" => "issue-done-2",
+                   "issue_identifier" => "MT-DONE-2",
+                   "issue_url" => "https://example.org/issues/MT-DONE-2",
+                   "title" => "Second completed task",
+                   "state" => "Done",
+                   "session_id" => "thread-done-2",
+                   "worker_host" => "dm-dev2",
+                   "workspace_path" => "/workspaces/MT-DONE-2",
+                   "started_at" => state_payload["worked_tasks"]["items"] |> Enum.at(0) |> Map.fetch!("started_at"),
+                   "completed_at" => state_payload["worked_tasks"]["items"] |> Enum.at(0) |> Map.fetch!("completed_at"),
+                   "duration_seconds" => 65,
+                   "turn_count" => 2,
+                   "last_event" => "turn_completed",
+                   "last_message" => nil,
+                   "tokens" => %{"input_tokens" => 100, "output_tokens" => 25, "total_tokens" => 125},
+                   "decisions" => [
+                     %{
+                       "at" =>
+                         state_payload["worked_tasks"]["items"]
+                         |> Enum.at(0)
+                         |> get_in(["decisions"])
+                         |> List.first()
+                         |> Map.fetch!("at"),
+                       "event" => "notification",
+                       "method" => "codex/event/agent_reasoning",
+                       "summary" => "reasoning update: picked API boundary"
+                     }
+                   ]
+                 },
+                 %{
+                   "task_id" => "task-done-1",
+                   "issue_id" => "issue-done-1",
+                   "issue_identifier" => "MT-DONE",
+                   "issue_url" => "https://example.org/issues/MT-DONE",
+                   "title" => "First completed task",
+                   "state" => "Done",
+                   "session_id" => "thread-done-1",
+                   "worker_host" => nil,
+                   "workspace_path" => "/workspaces/MT-DONE",
+                   "started_at" => state_payload["worked_tasks"]["items"] |> Enum.at(1) |> Map.fetch!("started_at"),
+                   "completed_at" => state_payload["worked_tasks"]["items"] |> Enum.at(1) |> Map.fetch!("completed_at"),
+                   "duration_seconds" => 42,
+                   "turn_count" => 1,
+                   "last_event" => "turn_completed",
+                   "last_message" => nil,
+                   "tokens" => %{"input_tokens" => 40, "output_tokens" => 8, "total_tokens" => 48},
+                   "decisions" => []
+                 }
+               ],
+               "page" => 1,
+               "page_size" => 10,
+               "total" => 2,
+               "total_pages" => 1
+             },
              "codex_totals" => %{
                "input_tokens" => 4,
                "output_tokens" => 8,
@@ -423,6 +545,7 @@ defmodule SymphonyElixir.ExtensionsTest do
              },
              "retry" => nil,
              "blocked" => nil,
+             "worked_task" => nil,
              "logs" => %{"codex_session_logs" => []},
              "recent_events" => [],
              "last_error" => nil,
@@ -443,6 +566,29 @@ defmodule SymphonyElixir.ExtensionsTest do
                "session_id" => "thread-blocked",
                "state" => "In Progress",
                "error" => "codex turn requires operator input"
+             }
+           } = json_response(conn, 200)
+
+    conn = get(build_conn(), "/api/v1/MT-DONE")
+
+    assert %{
+             "status" => "worked",
+             "worked_task" => %{
+               "issue_identifier" => "MT-DONE",
+               "duration_seconds" => 42,
+               "tokens" => %{"total_tokens" => 48}
+             }
+           } = json_response(conn, 200)
+
+    conn = get(build_conn(), "/api/v1/state?page=2&page_size=1")
+
+    assert %{
+             "worked_tasks" => %{
+               "page" => 2,
+               "page_size" => 1,
+               "total" => 2,
+               "total_pages" => 2,
+               "items" => [%{"issue_identifier" => "MT-DONE"}]
              }
            } = json_response(conn, 200)
 
@@ -780,6 +926,57 @@ defmodule SymphonyElixir.ExtensionsTest do
             timestamp: DateTime.utc_now()
           },
           last_codex_timestamp: DateTime.utc_now()
+        }
+      ],
+      worked_tasks: [
+        %{
+          task_id: "task-done-2",
+          issue_id: "issue-done-2",
+          identifier: "MT-DONE-2",
+          title: "Second completed task",
+          issue_url: "https://example.org/issues/MT-DONE-2",
+          state: "Done",
+          session_id: "thread-done-2",
+          worker_host: "dm-dev2",
+          workspace_path: "/workspaces/MT-DONE-2",
+          started_at: DateTime.add(DateTime.utc_now(), -65, :second),
+          completed_at: DateTime.utc_now(),
+          duration_seconds: 65,
+          turn_count: 2,
+          codex_input_tokens: 100,
+          codex_output_tokens: 25,
+          codex_total_tokens: 125,
+          last_codex_event: :turn_completed,
+          last_codex_message: nil,
+          decisions: [
+            %{
+              at: DateTime.utc_now(),
+              event: :notification,
+              method: "codex/event/agent_reasoning",
+              summary: "reasoning update: picked API boundary"
+            }
+          ]
+        },
+        %{
+          task_id: "task-done-1",
+          issue_id: "issue-done-1",
+          identifier: "MT-DONE",
+          title: "First completed task",
+          issue_url: "https://example.org/issues/MT-DONE",
+          state: "Done",
+          session_id: "thread-done-1",
+          worker_host: nil,
+          workspace_path: "/workspaces/MT-DONE",
+          started_at: DateTime.add(DateTime.utc_now(), -42, :second),
+          completed_at: DateTime.utc_now(),
+          duration_seconds: 42,
+          turn_count: 1,
+          codex_input_tokens: 40,
+          codex_output_tokens: 8,
+          codex_total_tokens: 48,
+          last_codex_event: :turn_completed,
+          last_codex_message: nil,
+          decisions: []
         }
       ],
       codex_totals: %{input_tokens: 4, output_tokens: 8, total_tokens: 12, seconds_running: 42.5},

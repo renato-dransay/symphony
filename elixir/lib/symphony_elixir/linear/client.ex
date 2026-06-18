@@ -10,7 +10,7 @@ defmodule SymphonyElixir.Linear.Client do
   @max_error_body_log_bytes 1_000
 
   @query """
-  query SymphonyLinearPoll($projectSlug: String!, $stateNames: [String!]!, $first: Int!, $relationFirst: Int!, $after: String) {
+  query SymphonyLinearPoll($projectSlug: String!, $stateNames: [String!]!, $first: Int!, $relationFirst: Int!, $attachmentFirst: Int!, $commentFirst: Int!, $after: String) {
     issues(filter: {project: {slugId: {eq: $projectSlug}}, state: {name: {in: $stateNames}}}, first: $first, after: $after) {
       nodes {
         id
@@ -43,6 +43,24 @@ defmodule SymphonyElixir.Linear.Client do
             }
           }
         }
+        attachments(first: $attachmentFirst) {
+          nodes {
+            title
+            url
+          }
+        }
+        comments(first: $commentFirst) {
+          nodes {
+            body
+            createdAt
+            updatedAt
+            user {
+              id
+              name
+              displayName
+            }
+          }
+        }
         createdAt
         updatedAt
       }
@@ -55,7 +73,7 @@ defmodule SymphonyElixir.Linear.Client do
   """
 
   @query_by_ids """
-  query SymphonyLinearIssuesById($ids: [ID!]!, $first: Int!, $relationFirst: Int!) {
+  query SymphonyLinearIssuesById($ids: [ID!]!, $first: Int!, $relationFirst: Int!, $attachmentFirst: Int!, $commentFirst: Int!) {
     issues(filter: {id: {in: $ids}}, first: $first) {
       nodes {
         id
@@ -85,6 +103,24 @@ defmodule SymphonyElixir.Linear.Client do
               state {
                 name
               }
+            }
+          }
+        }
+        attachments(first: $attachmentFirst) {
+          nodes {
+            title
+            url
+          }
+        }
+        comments(first: $commentFirst) {
+          nodes {
+            body
+            createdAt
+            updatedAt
+            user {
+              id
+              name
+              displayName
             }
           }
         }
@@ -247,6 +283,8 @@ defmodule SymphonyElixir.Linear.Client do
              stateNames: state_names,
              first: @issue_page_size,
              relationFirst: @issue_page_size,
+             attachmentFirst: @issue_page_size,
+             commentFirst: @issue_page_size,
              after: after_cursor
            }),
          {:ok, issues, page_info} <- decode_linear_page_response(body, assignee_filter) do
@@ -294,7 +332,9 @@ defmodule SymphonyElixir.Linear.Client do
     case graphql_fun.(@query_by_ids, %{
            ids: batch_ids,
            first: length(batch_ids),
-           relationFirst: @issue_page_size
+           relationFirst: @issue_page_size,
+           attachmentFirst: @issue_page_size,
+           commentFirst: @issue_page_size
          }) do
       {:ok, body} ->
         with {:ok, issues} <- decode_linear_response(body, assignee_filter) do
@@ -458,6 +498,8 @@ defmodule SymphonyElixir.Linear.Client do
       branch_name: issue["branchName"],
       url: issue["url"],
       assignee_id: assignee_field(assignee, "id"),
+      attachments: extract_attachments(issue),
+      comments: extract_comments(issue),
       blocked_by: extract_blockers(issue),
       labels: extract_labels(issue),
       assigned_to_worker: assigned_to_worker?(assignee, assignee_filter),
@@ -470,6 +512,52 @@ defmodule SymphonyElixir.Linear.Client do
 
   defp assignee_field(%{} = assignee, field) when is_binary(field), do: assignee[field]
   defp assignee_field(_assignee, _field), do: nil
+
+  defp extract_attachments(%{"attachments" => %{"nodes" => attachments}}) when is_list(attachments) do
+    attachments
+    |> Enum.map(fn
+      %{} = attachment ->
+        %{
+          title: attachment["title"],
+          url: attachment["url"]
+        }
+
+      _ ->
+        nil
+    end)
+    |> Enum.reject(&is_nil/1)
+  end
+
+  defp extract_attachments(_), do: []
+
+  defp extract_comments(%{"comments" => %{"nodes" => comments}}) when is_list(comments) do
+    comments
+    |> Enum.map(fn
+      %{} = comment ->
+        %{
+          body: comment["body"],
+          created_at: parse_datetime(comment["createdAt"]),
+          updated_at: parse_datetime(comment["updatedAt"]),
+          user: extract_comment_user(comment["user"])
+        }
+
+      _ ->
+        nil
+    end)
+    |> Enum.reject(&is_nil/1)
+  end
+
+  defp extract_comments(_), do: []
+
+  defp extract_comment_user(%{} = user) do
+    %{
+      id: user["id"],
+      name: user["name"],
+      display_name: user["displayName"]
+    }
+  end
+
+  defp extract_comment_user(_), do: nil
 
   defp assigned_to_worker?(_assignee, nil), do: true
 

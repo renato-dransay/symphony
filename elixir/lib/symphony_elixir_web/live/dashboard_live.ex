@@ -7,12 +7,15 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
   alias SymphonyElixirWeb.{Endpoint, ObservabilityPubSub, Presenter}
   @runtime_tick_ms 1_000
+  @worked_tasks_page_size 8
 
   @impl true
   def mount(_params, _session, socket) do
     socket =
       socket
-      |> assign(:payload, load_payload())
+      |> assign(:worked_tasks_page, 1)
+      |> assign(:worked_tasks_page_size, @worked_tasks_page_size)
+      |> assign(:payload, load_payload(1, @worked_tasks_page_size))
       |> assign(:now, DateTime.utc_now())
 
     if connected?(socket) do
@@ -31,9 +34,26 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
   @impl true
   def handle_info(:observability_updated, socket) do
+    page = socket.assigns.worked_tasks_page
+    page_size = socket.assigns.worked_tasks_page_size
+
     {:noreply,
      socket
-     |> assign(:payload, load_payload())
+     |> assign(:payload, load_payload(page, page_size))
+     |> assign(:now, DateTime.utc_now())}
+  end
+
+  @impl true
+  def handle_event("worked_tasks_page", %{"page" => page}, socket) do
+    page = positive_page(page, socket.assigns.worked_tasks_page)
+    page_size = socket.assigns.worked_tasks_page_size
+    payload = load_payload(page, page_size)
+    page = get_in(payload, [:worked_tasks, :page]) || page
+
+    {:noreply,
+     socket
+     |> assign(:worked_tasks_page, page)
+     |> assign(:payload, payload)
      |> assign(:now, DateTime.utc_now())}
   end
 
@@ -121,6 +141,121 @@ defmodule SymphonyElixirWeb.DashboardLive do
           </div>
 
           <pre class="code-panel"><%= pretty_value(@payload.rate_limits) %></pre>
+        </section>
+
+        <section class="section-card">
+          <div class="section-header">
+            <div>
+              <h2 class="section-title">Worked tasks</h2>
+              <p class="section-copy">
+                Page <%= @payload.worked_tasks.page %> of <%= @payload.worked_tasks.total_pages %> · <%= format_int(@payload.worked_tasks.total) %> tasks
+              </p>
+            </div>
+            <div class="pager-actions">
+              <button
+                type="button"
+                class="subtle-button"
+                phx-click="worked_tasks_page"
+                phx-value-page={@payload.worked_tasks.page - 1}
+                disabled={@payload.worked_tasks.page <= 1}
+              >
+                Previous
+              </button>
+              <button
+                type="button"
+                class="subtle-button"
+                phx-click="worked_tasks_page"
+                phx-value-page={@payload.worked_tasks.page + 1}
+                disabled={@payload.worked_tasks.page >= @payload.worked_tasks.total_pages}
+              >
+                Next
+              </button>
+            </div>
+          </div>
+
+          <%= if @payload.worked_tasks.items == [] do %>
+            <p class="empty-state">No completed task sessions in this runtime.</p>
+          <% else %>
+            <div class="table-wrap">
+              <table class="data-table data-table-worked">
+                <colgroup>
+                  <col style="width: 12rem;" />
+                  <col style="width: 11rem;" />
+                  <col style="width: 7rem;" />
+                  <col style="width: 10rem;" />
+                  <col style="width: 8rem;" />
+                  <col />
+                </colgroup>
+                <thead>
+                  <tr>
+                    <th>Issue</th>
+                    <th>Completed</th>
+                    <th>Duration</th>
+                    <th>Tokens</th>
+                    <th>Session</th>
+                    <th>Decisions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr :for={entry <- @payload.worked_tasks.items}>
+                    <td>
+                      <div class="issue-stack">
+                        <.issue_identifier identifier={entry.issue_identifier || "n/a"} url={entry.issue_url} />
+                        <%= if entry.title do %>
+                          <span class="muted event-text" title={entry.title}><%= entry.title %></span>
+                        <% end %>
+                        <a class="issue-link" href={"/api/v1/#{entry.issue_identifier}"}>JSON details</a>
+                      </div>
+                    </td>
+                    <td>
+                      <div class="detail-stack">
+                        <span class="mono numeric"><%= entry.completed_at || "n/a" %></span>
+                        <%= if entry.state do %>
+                          <span class={state_badge_class(entry.state)}>
+                            <%= entry.state %>
+                          </span>
+                        <% end %>
+                      </div>
+                    </td>
+                    <td class="numeric"><%= format_runtime_seconds(entry.duration_seconds || 0) %></td>
+                    <td>
+                      <div class="token-stack numeric">
+                        <span>Total: <%= format_int(entry.tokens.total_tokens) %></span>
+                        <span class="muted">In <%= format_int(entry.tokens.input_tokens) %> / Out <%= format_int(entry.tokens.output_tokens) %></span>
+                      </div>
+                    </td>
+                    <td>
+                      <%= if entry.session_id do %>
+                        <button
+                          type="button"
+                          class="subtle-button"
+                          data-label="Copy ID"
+                          data-copy={entry.session_id}
+                          onclick="navigator.clipboard.writeText(this.dataset.copy); this.textContent = 'Copied'; clearTimeout(this._copyTimer); this._copyTimer = setTimeout(() => { this.textContent = this.dataset.label }, 1200);"
+                        >
+                          Copy ID
+                        </button>
+                      <% else %>
+                        <span class="muted">n/a</span>
+                      <% end %>
+                    </td>
+                    <td>
+                      <%= if entry.decisions == [] do %>
+                        <span class="muted">No decision events captured.</span>
+                      <% else %>
+                        <div class="decision-list">
+                          <div :for={decision <- entry.decisions} class="decision-entry">
+                            <span class="decision-time mono numeric"><%= decision.at || "n/a" %></span>
+                            <span class="decision-text" title={decision.summary}><%= decision.summary %></span>
+                          </div>
+                        </div>
+                      <% end %>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          <% end %>
         </section>
 
         <section class="section-card">
@@ -329,8 +464,11 @@ defmodule SymphonyElixirWeb.DashboardLive do
     """
   end
 
-  defp load_payload do
-    Presenter.state_payload(orchestrator(), snapshot_timeout_ms())
+  defp load_payload(page, page_size) do
+    Presenter.state_payload(orchestrator(), snapshot_timeout_ms(),
+      worked_tasks_page: page,
+      worked_tasks_page_size: page_size
+    )
   end
 
   defp orchestrator do
@@ -443,4 +581,14 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
   defp pretty_value(nil), do: "n/a"
   defp pretty_value(value), do: inspect(value, pretty: true, limit: :infinity)
+
+  defp positive_page(value, default) when is_binary(value) do
+    case Integer.parse(String.trim(value)) do
+      {page, ""} when page > 0 -> page
+      _ -> default
+    end
+  end
+
+  defp positive_page(value, _default) when is_integer(value) and value > 0, do: value
+  defp positive_page(_value, default), do: default
 end

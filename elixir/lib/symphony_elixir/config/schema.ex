@@ -248,6 +248,43 @@ defmodule SymphonyElixir.Config.Schema do
     end
   end
 
+  defmodule Github do
+    @moduledoc false
+    use Ecto.Schema
+    import Ecto.Changeset
+
+    @primary_key false
+    embedded_schema do
+      field(:pr_watch_enabled, :boolean, default: true)
+      field(:command, :string, default: "gh")
+      field(:watch_states, {:array, :string}, default: ["Human Review", "In Review"])
+      field(:ignored_comment_logins, {:array, :string}, default: ["linear-code"])
+    end
+
+    @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+    def changeset(schema, attrs) do
+      schema
+      |> cast(attrs, [:pr_watch_enabled, :command, :watch_states, :ignored_comment_logins], empty_values: [])
+      |> validate_required([:command])
+      |> update_change(:watch_states, &normalize_string_list/1)
+      |> update_change(:ignored_comment_logins, &normalize_login_list/1)
+    end
+
+    defp normalize_string_list(values) when is_list(values) do
+      values
+      |> Enum.map(&String.trim/1)
+      |> Enum.reject(&(&1 == ""))
+      |> Enum.uniq()
+    end
+
+    defp normalize_login_list(values) when is_list(values) do
+      values
+      |> Enum.map(&(String.trim(&1) |> String.downcase()))
+      |> Enum.reject(&(&1 == ""))
+      |> Enum.uniq()
+    end
+  end
+
   defmodule Server do
     @moduledoc false
     use Ecto.Schema
@@ -276,6 +313,7 @@ defmodule SymphonyElixir.Config.Schema do
     embeds_one(:codex, Codex, on_replace: :update, defaults_to_struct: true)
     embeds_one(:hooks, Hooks, on_replace: :update, defaults_to_struct: true)
     embeds_one(:observability, Observability, on_replace: :update, defaults_to_struct: true)
+    embeds_one(:github, Github, on_replace: :update, defaults_to_struct: true)
     embeds_one(:server, Server, on_replace: :update, defaults_to_struct: true)
   end
 
@@ -368,6 +406,7 @@ defmodule SymphonyElixir.Config.Schema do
     |> cast_embed(:codex, with: &Codex.changeset/2)
     |> cast_embed(:hooks, with: &Hooks.changeset/2)
     |> cast_embed(:observability, with: &Observability.changeset/2)
+    |> cast_embed(:github, with: &Github.changeset/2)
     |> cast_embed(:server, with: &Server.changeset/2)
   end
 

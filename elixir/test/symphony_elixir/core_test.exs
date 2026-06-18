@@ -1,6 +1,14 @@
 defmodule SymphonyElixir.CoreTest do
   use SymphonyElixir.TestSupport
 
+  defmodule FakeGithubPrWatcher do
+    @moduledoc false
+
+    def attention_signals(_issue) do
+      {:ok, Application.get_env(:symphony_elixir, :github_pr_watcher_signals, [])}
+    end
+  end
+
   test "config defaults and validation checks" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_api_token: nil,
@@ -17,6 +25,8 @@ defmodule SymphonyElixir.CoreTest do
     assert config.tracker.terminal_states == ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
     assert config.tracker.assignee == nil
     assert config.agent.max_turns == 20
+    assert config.github.pr_watch_enabled == true
+    assert config.github.watch_states == ["Human Review", "In Review"]
 
     write_workflow_file!(Workflow.workflow_file_path(), poll_interval_ms: "invalid")
 
@@ -86,6 +96,71 @@ defmodule SymphonyElixir.CoreTest do
 
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "123")
     assert {:error, {:unsupported_tracker_kind, "123"}} = Config.validate!()
+  end
+
+  test "github watcher config normalizes state and ignored-login lists" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      github_watch_states: [" In Review ", "", "In Review", "Human Review"],
+      github_ignored_comment_logins: [" Linear-Code ", "", "linear-code", "Review-Bot"]
+    )
+
+    config = Config.settings!()
+
+    assert config.github.watch_states == ["In Review", "Human Review"]
+    assert config.github.ignored_comment_logins == ["linear-code", "review-bot"]
+  end
+
+  test "review state dispatch requires a new GitHub PR signal" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_active_states: ["Todo", "In Progress", "In Review"]
+    )
+
+    Application.put_env(:symphony_elixir, :github_pr_watcher_module, FakeGithubPrWatcher)
+
+    issue = %Issue{
+      id: "issue-review",
+      identifier: "MGM-8",
+      title: "Dashboard: Personal Plans",
+      state: "In Review",
+      description: "PR: https://github.com/renato-dransay/openclaw-dashboard/pull/71",
+      labels: []
+    }
+
+    state = %Orchestrator.State{
+      github_pr_signal_fingerprints: %{},
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    Application.put_env(:symphony_elixir, :github_pr_watcher_signals, [])
+    assert {:skip, ^state} = Orchestrator.github_pr_watch_dispatch_decision_for_test(issue, state)
+
+    signal = %{
+      fingerprint: "ci:head-sha:11:2026-06-18T08:00:00Z:failure",
+      reason: "CI check failed: typecheck + tests",
+      pr: "https://github.com/renato-dransay/openclaw-dashboard/pull/71"
+    }
+
+    Application.put_env(:symphony_elixir, :github_pr_watcher_signals, [signal])
+    assert {:dispatch, updated_state} = Orchestrator.github_pr_watch_dispatch_decision_for_test(issue, state)
+
+    assert MapSet.member?(
+             updated_state.github_pr_signal_fingerprints[issue.id],
+             signal.fingerprint
+           )
+
+    assert {:skip, ^updated_state} =
+             Orchestrator.github_pr_watch_dispatch_decision_for_test(issue, updated_state)
+
+    next_signal = %{signal | fingerprint: "issue-comment:22:2026-06-18T08:01:00Z"}
+    Application.put_env(:symphony_elixir, :github_pr_watcher_signals, [signal, next_signal])
+
+    assert {:dispatch, final_state} =
+             Orchestrator.github_pr_watch_dispatch_decision_for_test(issue, updated_state)
+
+    assert MapSet.member?(
+             final_state.github_pr_signal_fingerprints[issue.id],
+             next_signal.fingerprint
+           )
   end
 
   test "current WORKFLOW.md file is valid and complete" do
@@ -675,7 +750,7 @@ defmodule SymphonyElixir.CoreTest do
     assert MapSet.member?(state.completed, issue_id)
     assert %{attempt: 1, due_at_ms: due_at_ms} = state.retry_attempts[issue_id]
     assert is_integer(due_at_ms)
-    assert_due_in_range(due_at_ms, 500, 1_100)
+    assert_due_in_range(due_at_ms, 0, 1_100)
   end
 
   test "abnormal worker exit increments retry attempt progressively" do

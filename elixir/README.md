@@ -118,6 +118,15 @@ Notes:
 - `tracker.required_labels` is optional. When set, an issue must have every
   configured label to dispatch or continue running. Label matching ignores
   case and surrounding whitespace. A blank configured label matches no issue.
+- GitHub PR watching is enabled by default for `Human Review` and `In Review`.
+  When one of those states is also listed in `tracker.active_states`, Symphony
+  does not continuously dispatch it; instead it wakes the issue only when a
+  linked GitHub PR has a new failed check, PR issue comment, inline review
+  comment, or blocking review state. Linked PRs are discovered from Linear issue
+  descriptions, attachments/resources, and comments.
+- GitHub PR watching uses the configured `github.command` (`gh` by default), so
+  the host running Symphony must have GitHub CLI auth that can read the linked
+  PRs and check runs.
 - Safer Codex defaults are used when policy fields are omitted:
   - `codex.approval_policy` defaults to `{"reject":{"sandbox_approval":true,"rules":true,"mcp_elicitations":true}}`
   - `codex.thread_sandbox` defaults to `workspace-write`

@@ -43,8 +43,14 @@ defmodule SymphonyElixir.TestSupport do
           Application.delete_env(:symphony_elixir, :server_port_override)
           Application.delete_env(:symphony_elixir, :memory_tracker_issues)
           Application.delete_env(:symphony_elixir, :memory_tracker_recipient)
+          Application.delete_env(:symphony_elixir, :github_pr_watcher_module)
+          Application.delete_env(:symphony_elixir, :github_pr_watcher_signals)
+          Application.delete_env(:symphony_elixir, :worked_task_history_enabled)
+          Application.delete_env(:symphony_elixir, :worked_task_history_loader)
           File.rm_rf(workflow_root)
         end)
+
+        Application.put_env(:symphony_elixir, :worked_task_history_enabled, false)
 
         :ok
       end
@@ -70,7 +76,16 @@ defmodule SymphonyElixir.TestSupport do
   def restore_env(key, value), do: System.put_env(key, value)
 
   def stop_default_http_server do
-    case Enum.find(Supervisor.which_children(SymphonyElixir.Supervisor), fn
+    supervisor = Process.whereis(SymphonyElixir.Supervisor)
+
+    children =
+      if is_pid(supervisor) do
+        Supervisor.which_children(supervisor)
+      else
+        []
+      end
+
+    case Enum.find(children, fn
            {SymphonyElixir.HttpServer, _pid, _type, _modules} -> true
            _child -> false
          end) do
@@ -123,6 +138,10 @@ defmodule SymphonyElixir.TestSupport do
           observability_enabled: true,
           observability_refresh_ms: 1_000,
           observability_render_interval_ms: 16,
+          github_pr_watch_enabled: true,
+          github_command: "gh",
+          github_watch_states: ["Human Review", "In Review"],
+          github_ignored_comment_logins: ["linear-code"],
           server_port: nil,
           server_host: nil,
           prompt: @workflow_prompt
@@ -161,6 +180,10 @@ defmodule SymphonyElixir.TestSupport do
     observability_enabled = Keyword.get(config, :observability_enabled)
     observability_refresh_ms = Keyword.get(config, :observability_refresh_ms)
     observability_render_interval_ms = Keyword.get(config, :observability_render_interval_ms)
+    github_pr_watch_enabled = Keyword.get(config, :github_pr_watch_enabled)
+    github_command = Keyword.get(config, :github_command)
+    github_watch_states = Keyword.get(config, :github_watch_states)
+    github_ignored_comment_logins = Keyword.get(config, :github_ignored_comment_logins)
     server_port = Keyword.get(config, :server_port)
     server_host = Keyword.get(config, :server_host)
     prompt = Keyword.get(config, :prompt)
@@ -197,6 +220,7 @@ defmodule SymphonyElixir.TestSupport do
         "  stall_timeout_ms: #{yaml_value(codex_stall_timeout_ms)}",
         hooks_yaml(hook_after_create, hook_before_run, hook_after_run, hook_before_remove, hook_timeout_ms),
         observability_yaml(observability_enabled, observability_refresh_ms, observability_render_interval_ms),
+        github_yaml(github_pr_watch_enabled, github_command, github_watch_states, github_ignored_comment_logins),
         server_yaml(server_port, server_host),
         "---",
         prompt
@@ -264,6 +288,17 @@ defmodule SymphonyElixir.TestSupport do
       "  dashboard_enabled: #{yaml_value(enabled)}",
       "  refresh_ms: #{yaml_value(refresh_ms)}",
       "  render_interval_ms: #{yaml_value(render_interval_ms)}"
+    ]
+    |> Enum.join("\n")
+  end
+
+  defp github_yaml(pr_watch_enabled, command, watch_states, ignored_comment_logins) do
+    [
+      "github:",
+      "  pr_watch_enabled: #{yaml_value(pr_watch_enabled)}",
+      "  command: #{yaml_value(command)}",
+      "  watch_states: #{yaml_value(watch_states)}",
+      "  ignored_comment_logins: #{yaml_value(ignored_comment_logins)}"
     ]
     |> Enum.join("\n")
   end

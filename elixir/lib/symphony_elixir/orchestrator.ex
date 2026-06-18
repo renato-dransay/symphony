@@ -7,11 +7,15 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, WorkedTaskHistory, Workspace}
+  alias SymphonyElixir.GitHub.PrWatcher
   alias SymphonyElixir.Linear.Issue
 
   @continuation_retry_delay_ms 1_000
   @failure_retry_base_ms 10_000
+  @in_progress_state "In Progress"
+  @max_worked_tasks 100
+  @max_task_decisions 20
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
   @empty_codex_totals %{
@@ -26,6 +30,8 @@ defmodule SymphonyElixir.Orchestrator do
     Runtime state for the orchestrator polling loop.
     """
 
+    @type t :: %__MODULE__{}
+
     defstruct [
       :poll_interval_ms,
       :max_concurrent_agents,
@@ -35,11 +41,13 @@ defmodule SymphonyElixir.Orchestrator do
       :tick_token,
       running: %{},
       completed: MapSet.new(),
+      worked_tasks: [],
       claimed: MapSet.new(),
       blocked: %{},
       retry_attempts: %{},
       codex_totals: nil,
-      codex_rate_limits: nil
+      codex_rate_limits: nil,
+      github_pr_signal_fingerprints: %{}
     ]
   end
 
@@ -397,6 +405,19 @@ defmodule SymphonyElixir.Orchestrator do
   @spec select_worker_host_for_test(term(), String.t() | nil) :: String.t() | nil | :no_worker_capacity
   def select_worker_host_for_test(%State{} = state, preferred_worker_host) do
     select_worker_host(state, preferred_worker_host)
+  end
+
+  @doc false
+  @spec github_pr_watch_dispatch_decision_for_test(Issue.t(), State.t()) ::
+          {:dispatch, State.t()} | {:skip, State.t()}
+  def github_pr_watch_dispatch_decision_for_test(%Issue{} = issue, %State{} = state) do
+    github_pr_watch_dispatch_decision(issue, state)
+  end
+
+  @doc false
+  @spec mark_issue_in_progress_for_test(Issue.t()) :: Issue.t()
+  def mark_issue_in_progress_for_test(%Issue{} = issue) do
+    mark_issue_in_progress(issue)
   end
 
   defp reconcile_running_issue_states([], state, _active_states, _terminal_states), do: state
@@ -773,12 +794,23 @@ defmodule SymphonyElixir.Orchestrator do
     issues
     |> sort_issues_for_dispatch()
     |> Enum.reduce(state, fn issue, state_acc ->
-      if should_dispatch_issue?(issue, state_acc, active_states, terminal_states) do
-        dispatch_issue(state_acc, issue)
-      else
-        state_acc
-      end
+      maybe_dispatch_issue(issue, state_acc, active_states, terminal_states)
     end)
+  end
+
+  defp maybe_dispatch_issue(issue, state, active_states, terminal_states) do
+    if should_dispatch_issue?(issue, state, active_states, terminal_states) do
+      dispatch_issue_after_github_watch(issue, state)
+    else
+      state
+    end
+  end
+
+  defp dispatch_issue_after_github_watch(issue, state) do
+    case github_pr_watch_dispatch_decision(issue, state) do
+      {:dispatch, state} -> dispatch_issue(state, issue)
+      {:skip, state} -> state
+    end
   end
 
   defp sort_issues_for_dispatch(issues) when is_list(issues) do
@@ -927,6 +959,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp do_dispatch_issue(%State{} = state, issue, attempt, preferred_worker_host) do
+    issue = mark_issue_in_progress(issue)
     recipient = self()
 
     case select_worker_host(state, preferred_worker_host) do
@@ -967,6 +1000,7 @@ defmodule SymphonyElixir.Orchestrator do
             codex_last_reported_input_tokens: 0,
             codex_last_reported_output_tokens: 0,
             codex_last_reported_total_tokens: 0,
+            decisions: [],
             turn_count: 0,
             retry_attempt: normalize_retry_attempt(attempt),
             started_at: DateTime.utc_now()
@@ -1011,6 +1045,26 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp revalidate_issue_for_dispatch(issue, _issue_fetcher, _terminal_states), do: {:ok, issue}
+
+  defp mark_issue_in_progress(%Issue{id: issue_id, state: state} = issue)
+       when is_binary(issue_id) and is_binary(state) do
+    if normalize_issue_state(state) == "todo" do
+      case Tracker.update_issue_state(issue_id, @in_progress_state) do
+        :ok ->
+          Logger.info("Moved issue to In Progress before dispatch: #{issue_context(issue)}")
+          %{issue | state: @in_progress_state}
+
+        {:error, reason} ->
+          Logger.warning("Unable to move issue to In Progress before dispatch: #{issue_context(issue)} reason=#{inspect(reason)}")
+
+          issue
+      end
+    else
+      issue
+    end
+  end
+
+  defp mark_issue_in_progress(%Issue{} = issue), do: issue
 
   defp complete_issue(%State{} = state, issue_id) do
     %{
@@ -1163,7 +1217,14 @@ defmodule SymphonyElixir.Orchestrator do
     if retry_candidate_issue?(issue, terminal_state_set()) and
          dispatch_slots_available?(issue, state) and
          worker_slots_available?(state, metadata[:worker_host]) do
-      {:noreply, dispatch_issue(state, issue, attempt, metadata[:worker_host])}
+      case github_pr_watch_dispatch_decision(issue, state) do
+        {:dispatch, state} ->
+          {:noreply, dispatch_issue(state, issue, attempt, metadata[:worker_host])}
+
+        {:skip, state} ->
+          Logger.debug("No new GitHub PR signal for #{issue_context(issue)}; releasing review-state claim")
+          {:noreply, release_issue_claim(state, issue.id)}
+      end
     else
       Logger.debug("No available slots for retrying #{issue_context(issue)}; retrying again")
 
@@ -1429,11 +1490,14 @@ defmodule SymphonyElixir.Orchestrator do
         }
       end)
 
+    worked_tasks = snapshot_worked_tasks(state)
+
     {:reply,
      %{
        running: running,
        retrying: retrying,
        blocked: blocked,
+       worked_tasks: worked_tasks,
        codex_totals: state.codex_totals,
        rate_limits: Map.get(state, :codex_rate_limits),
        polling: %{
@@ -1465,6 +1529,39 @@ defmodule SymphonyElixir.Orchestrator do
   defp blocked_issue_url(%{issue: %Issue{url: url}}), do: url
   defp blocked_issue_url(_metadata), do: nil
 
+  defp snapshot_worked_tasks(%State{worked_tasks: worked_tasks}) do
+    worked_tasks
+    |> merge_worked_tasks(historical_worked_tasks())
+    |> Enum.take(@max_worked_tasks)
+  end
+
+  defp historical_worked_tasks do
+    if Application.get_env(:symphony_elixir, :worked_task_history_enabled, true) do
+      case Application.get_env(:symphony_elixir, :worked_task_history_loader) do
+        loader when is_function(loader, 1) -> loader.(limit: @max_worked_tasks)
+        {module, function} -> apply(module, function, [[limit: @max_worked_tasks]])
+        _loader -> WorkedTaskHistory.recent_tasks(limit: @max_worked_tasks)
+      end
+    else
+      []
+    end
+  end
+
+  defp merge_worked_tasks(current_tasks, historical_tasks) do
+    current_tasks
+    |> Kernel.++(historical_tasks)
+    |> Enum.reject(&is_nil/1)
+    |> Enum.uniq_by(&Map.get(&1, :task_id))
+    |> Enum.sort_by(&worked_task_completed_sort_key/1, :desc)
+  end
+
+  defp worked_task_completed_sort_key(task) do
+    case Map.get(task, :completed_at) do
+      %DateTime{} = datetime -> DateTime.to_unix(datetime, :microsecond)
+      _datetime -> 0
+    end
+  end
+
   defp integrate_codex_update(running_entry, %{event: event, timestamp: timestamp} = update) do
     token_delta = extract_token_delta(running_entry, update)
     codex_input_tokens = Map.get(running_entry, :codex_input_tokens, 0)
@@ -1476,8 +1573,9 @@ defmodule SymphonyElixir.Orchestrator do
     last_reported_total = Map.get(running_entry, :codex_last_reported_total_tokens, 0)
     turn_count = Map.get(running_entry, :turn_count, 0)
 
-    {
-      Map.merge(running_entry, %{
+    updated_running_entry =
+      running_entry
+      |> Map.merge(%{
         last_codex_timestamp: timestamp,
         last_codex_message: summarize_codex_update(update),
         session_id: session_id_for_update(running_entry.session_id, update),
@@ -1490,9 +1588,10 @@ defmodule SymphonyElixir.Orchestrator do
         codex_last_reported_output_tokens: max(last_reported_output, token_delta.output_reported),
         codex_last_reported_total_tokens: max(last_reported_total, token_delta.total_reported),
         turn_count: turn_count_for_update(turn_count, running_entry.session_id, update)
-      }),
-      token_delta
-    }
+      })
+      |> append_decision_for_update(update)
+
+    {updated_running_entry, token_delta}
   end
 
   defp codex_app_server_pid_for_update(_existing, %{codex_app_server_pid: pid})
@@ -1572,6 +1671,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp record_session_completion_totals(state, running_entry) when is_map(running_entry) do
     runtime_seconds = running_seconds(running_entry.started_at, DateTime.utc_now())
+    completed_task = completed_task_from_running_entry(running_entry, runtime_seconds)
 
     codex_totals =
       apply_token_delta(
@@ -1584,10 +1684,213 @@ defmodule SymphonyElixir.Orchestrator do
         }
       )
 
-    %{state | codex_totals: codex_totals}
+    %{
+      state
+      | codex_totals: codex_totals,
+        worked_tasks: prepend_worked_task(state.worked_tasks, completed_task)
+    }
   end
 
   defp record_session_completion_totals(state, _running_entry), do: state
+
+  defp completed_task_from_running_entry(running_entry, runtime_seconds) do
+    completed_at = DateTime.utc_now()
+    session_id = running_entry_session_id(running_entry)
+    issue = Map.get(running_entry, :issue)
+    started_at = Map.get(running_entry, :started_at)
+    identifier = Map.get(running_entry, :identifier)
+    issue_id = issue_id_from_running_entry(running_entry)
+
+    %{
+      task_id: completed_task_id(issue_id, session_id, started_at, completed_at),
+      issue_id: issue_id,
+      identifier: identifier,
+      title: issue_title(issue),
+      issue_url: issue_url(issue),
+      state: issue_state(issue),
+      session_id: session_id,
+      worker_host: Map.get(running_entry, :worker_host),
+      workspace_path: Map.get(running_entry, :workspace_path),
+      started_at: started_at,
+      completed_at: completed_at,
+      duration_seconds: runtime_seconds,
+      turn_count: Map.get(running_entry, :turn_count, 0),
+      codex_input_tokens: Map.get(running_entry, :codex_input_tokens, 0),
+      codex_output_tokens: Map.get(running_entry, :codex_output_tokens, 0),
+      codex_total_tokens: Map.get(running_entry, :codex_total_tokens, 0),
+      last_codex_event: Map.get(running_entry, :last_codex_event),
+      last_codex_message: Map.get(running_entry, :last_codex_message),
+      decisions: Map.get(running_entry, :decisions, [])
+    }
+  end
+
+  defp prepend_worked_task(tasks, %{task_id: task_id} = task) when is_list(tasks) do
+    tasks
+    |> Enum.reject(&(Map.get(&1, :task_id) == task_id))
+    |> then(&[task | &1])
+    |> Enum.take(@max_worked_tasks)
+  end
+
+  defp prepend_worked_task(_tasks, task), do: [task]
+
+  defp completed_task_id(issue_id, session_id, started_at, completed_at) do
+    [
+      issue_id || "unknown",
+      session_id,
+      datetime_id_part(started_at),
+      DateTime.to_iso8601(completed_at)
+    ]
+    |> Enum.join(":")
+  end
+
+  defp datetime_id_part(%DateTime{} = datetime), do: DateTime.to_iso8601(datetime)
+  defp datetime_id_part(_datetime), do: "no-start"
+
+  defp issue_id_from_running_entry(%{issue: %Issue{id: issue_id}}) when is_binary(issue_id), do: issue_id
+  defp issue_id_from_running_entry(%{issue_id: issue_id}) when is_binary(issue_id), do: issue_id
+  defp issue_id_from_running_entry(_running_entry), do: nil
+
+  defp issue_title(%Issue{title: title}) when is_binary(title), do: title
+  defp issue_title(_issue), do: nil
+
+  defp issue_url(%Issue{url: url}) when is_binary(url), do: url
+  defp issue_url(_issue), do: nil
+
+  defp issue_state(%Issue{state: state}) when is_binary(state), do: state
+  defp issue_state(_issue), do: nil
+
+  defp append_decision_for_update(running_entry, update) when is_map(running_entry) do
+    case decision_entry_for_update(update) do
+      nil ->
+        running_entry
+
+      decision ->
+        Map.update(running_entry, :decisions, [decision], &append_decision(&1, decision))
+    end
+  end
+
+  defp append_decision(decisions, decision) when is_list(decisions) do
+    duplicate? =
+      Enum.any?(decisions, fn existing ->
+        Map.get(existing, :method) == Map.get(decision, :method) and
+          Map.get(existing, :summary) == Map.get(decision, :summary)
+      end)
+
+    if duplicate? do
+      decisions
+    else
+      decisions
+      |> Kernel.++([decision])
+      |> Enum.take(-@max_task_decisions)
+    end
+  end
+
+  defp append_decision(_decisions, decision), do: [decision]
+
+  defp decision_entry_for_update(%{timestamp: timestamp} = update) do
+    method = codex_update_method(update)
+    event = Map.get(update, :event)
+
+    if decision_update?(event, method) do
+      summary = update |> summarize_codex_update() |> StatusDashboard.humanize_codex_message()
+
+      %{
+        at: timestamp,
+        event: event,
+        method: method,
+        summary: summary
+      }
+    end
+  end
+
+  defp decision_update?(event, method) do
+    decision_event?(event) or decision_method?(method)
+  end
+
+  defp decision_event?(event)
+       when event in [
+              :approval_auto_approved,
+              :tool_input_auto_answered,
+              :tool_call_completed,
+              :tool_call_failed,
+              :unsupported_tool_call
+            ],
+       do: true
+
+  defp decision_event?(_event), do: false
+
+  defp decision_method?(method) when is_binary(method) do
+    method in [
+      "turn/plan/updated",
+      "item/tool/call",
+      "item/commandExecution/requestApproval",
+      "item/fileChange/requestApproval",
+      "item/tool/requestUserInput",
+      "tool/requestUserInput",
+      "codex/event/agent_reasoning",
+      "codex/event/exec_command_begin",
+      "codex/event/mcp_tool_call_begin",
+      "codex/event/mcp_tool_call_end"
+    ]
+  end
+
+  defp decision_method?(_method), do: false
+
+  defp codex_update_method(update) when is_map(update) do
+    payload =
+      Map.get(update, :payload) ||
+        Map.get(update, "payload") ||
+        update
+
+    map_value(payload, ["method", :method]) ||
+      map_path(payload, ["params", "msg", "type"]) ||
+      map_path(payload, [:params, :msg, :type])
+  end
+
+  defp map_path(data, [key | rest]) when is_map(data) do
+    case fetch_map_key(data, key) do
+      {:ok, value} when rest == [] -> value
+      {:ok, value} -> map_path(value, rest)
+      :error -> nil
+    end
+  end
+
+  defp map_path(_data, _path), do: nil
+
+  defp map_value(data, keys) when is_map(data) and is_list(keys) do
+    Enum.find_value(keys, fn key ->
+      case fetch_map_key(data, key) do
+        {:ok, value} -> value
+        :error -> nil
+      end
+    end)
+  end
+
+  defp map_value(_data, _keys), do: nil
+
+  defp fetch_map_key(data, key) when is_map(data) do
+    cond do
+      Map.has_key?(data, key) ->
+        {:ok, Map.fetch!(data, key)}
+
+      is_atom(key) and Map.has_key?(data, Atom.to_string(key)) ->
+        {:ok, Map.fetch!(data, Atom.to_string(key))}
+
+      is_binary(key) ->
+        atom_key = String.to_existing_atom(key)
+
+        if Map.has_key?(data, atom_key) do
+          {:ok, Map.fetch!(data, atom_key)}
+        else
+          :error
+        end
+
+      true ->
+        :error
+    end
+  rescue
+    ArgumentError -> :error
+  end
 
   defp refresh_runtime_config(%State{} = state) do
     config = Config.settings!()
@@ -1602,6 +1905,91 @@ defmodule SymphonyElixir.Orchestrator do
   defp retry_candidate_issue?(%Issue{} = issue, terminal_states) do
     candidate_issue?(issue, active_state_set(), terminal_states) and
       !todo_issue_blocked_by_non_terminal?(issue, terminal_states)
+  end
+
+  defp github_pr_watch_dispatch_decision(%Issue{} = issue, %State{} = state) do
+    cond do
+      !github_pr_watch_state?(issue.state) ->
+        {:dispatch, state}
+
+      !Config.settings!().github.pr_watch_enabled ->
+        {:dispatch, state}
+
+      true ->
+        case github_pr_watcher_module().attention_signals(issue) do
+          {:ok, signals} ->
+            dispatch_on_new_github_pr_signals(issue, state, signals)
+
+          {:error, reason} ->
+            Logger.warning("Skipping GitHub PR watch dispatch for #{issue_context(issue)}: #{inspect(reason)}")
+            {:skip, state}
+        end
+    end
+  end
+
+  defp dispatch_on_new_github_pr_signals(%Issue{} = issue, %State{} = state, signals)
+       when is_list(signals) do
+    current_fingerprints = Map.get(state.github_pr_signal_fingerprints, issue.id, MapSet.new())
+
+    new_fingerprints =
+      signals
+      |> Enum.map(&github_pr_signal_fingerprint/1)
+      |> Enum.reject(&(is_nil(&1) or MapSet.member?(current_fingerprints, &1)))
+      |> MapSet.new()
+
+    if MapSet.size(new_fingerprints) > 0 do
+      reasons =
+        signals
+        |> Enum.filter(&(github_pr_signal_fingerprint(&1) in new_fingerprints))
+        |> Enum.map_join("; ", &github_pr_signal_reason/1)
+
+      Logger.info("Dispatching review-state issue for GitHub PR signal: #{issue_context(issue)} signals=#{reasons}")
+
+      {:dispatch,
+       %{
+         state
+         | github_pr_signal_fingerprints:
+             Map.put(
+               state.github_pr_signal_fingerprints,
+               issue.id,
+               MapSet.union(current_fingerprints, new_fingerprints)
+             )
+       }}
+    else
+      {:skip, state}
+    end
+  end
+
+  defp github_pr_signal_fingerprint(%{fingerprint: fingerprint}) when is_binary(fingerprint), do: fingerprint
+  defp github_pr_signal_fingerprint(%{"fingerprint" => fingerprint}) when is_binary(fingerprint), do: fingerprint
+  defp github_pr_signal_fingerprint(_signal), do: nil
+
+  defp github_pr_signal_reason(%{reason: reason, pr: pr}) when is_binary(reason) and is_binary(pr) do
+    "#{reason} (#{pr})"
+  end
+
+  defp github_pr_signal_reason(%{reason: reason}) when is_binary(reason), do: reason
+
+  defp github_pr_signal_reason(%{"reason" => reason, "pr" => pr}) when is_binary(reason) and is_binary(pr) do
+    "#{reason} (#{pr})"
+  end
+
+  defp github_pr_signal_reason(%{"reason" => reason}) when is_binary(reason), do: reason
+  defp github_pr_signal_reason(_signal), do: "unknown"
+
+  defp github_pr_watch_state?(state_name) when is_binary(state_name) do
+    watch_states =
+      Config.settings!().github.watch_states
+      |> Enum.map(&normalize_issue_state/1)
+      |> MapSet.new()
+
+    MapSet.member?(watch_states, normalize_issue_state(state_name))
+  end
+
+  defp github_pr_watch_state?(_state_name), do: false
+
+  defp github_pr_watcher_module do
+    Application.get_env(:symphony_elixir, :github_pr_watcher_module, PrWatcher)
   end
 
   defp dispatch_slots_available?(%Issue{} = issue, %State{} = state) do

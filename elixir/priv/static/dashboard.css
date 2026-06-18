@@ -71,6 +71,16 @@ button:hover {
   box-shadow: 0 12px 24px rgba(16, 163, 127, 0.22);
 }
 
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.48;
+}
+
+button:disabled:hover {
+  transform: none;
+  box-shadow: none;
+}
+
 button.secondary {
   background: var(--card);
   color: var(--ink);
@@ -293,6 +303,12 @@ pre,
   font-size: 0.94rem;
 }
 
+.pager-actions {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+}
+
 .table-wrap {
   overflow-x: auto;
   margin-top: 1rem;
@@ -307,6 +323,11 @@ pre,
 .data-table-running {
   table-layout: fixed;
   min-width: 980px;
+}
+
+.data-table-worked {
+  table-layout: fixed;
+  min-width: 1120px;
 }
 
 .data-table th {
@@ -349,6 +370,31 @@ pre,
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.decision-list {
+  display: grid;
+  gap: 0.45rem;
+}
+
+.decision-entry {
+  display: grid;
+  gap: 0.14rem;
+  min-width: 0;
+}
+
+.decision-time {
+  color: var(--muted);
+  font-size: 0.74rem;
+}
+
+.decision-text {
+  display: block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.88rem;
 }
 
 .state-badge {

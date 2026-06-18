@@ -9,8 +9,8 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
   alias SymphonyElixirWeb.{Endpoint, Presenter}
 
   @spec state(Conn.t(), map()) :: Conn.t()
-  def state(conn, _params) do
-    json(conn, Presenter.state_payload(orchestrator(), snapshot_timeout_ms()))
+  def state(conn, params) do
+    json(conn, Presenter.state_payload(orchestrator(), snapshot_timeout_ms(), worked_task_options(params)))
   end
 
   @spec issue(Conn.t(), map()) :: Conn.t()
@@ -59,5 +59,12 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
 
   defp snapshot_timeout_ms do
     Endpoint.config(:snapshot_timeout_ms) || 15_000
+  end
+
+  defp worked_task_options(params) when is_map(params) do
+    [
+      worked_tasks_page: Map.get(params, "worked_tasks_page") || Map.get(params, "page"),
+      worked_tasks_page_size: Map.get(params, "worked_tasks_page_size") || Map.get(params, "page_size")
+    ]
   end
 end

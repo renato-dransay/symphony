@@ -182,6 +182,23 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
        }}
     )
 
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       %{
+         event: :notification,
+         payload: %{
+           "method" => "codex/event/agent_reasoning",
+           "params" => %{
+             "msg" => %{
+               "payload" => %{"summaryText" => "choose the review-state watcher boundary"}
+             }
+           }
+         },
+         timestamp: now
+       }}
+    )
+
     snapshot = GenServer.call(pid, :snapshot)
     assert %{running: [snapshot_entry]} = snapshot
     assert snapshot_entry.codex_app_server_pid == "4242"
@@ -198,6 +215,80 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert completed_state.codex_totals.output_tokens == 4
     assert completed_state.codex_totals.total_tokens == 16
     assert is_integer(completed_state.codex_totals.seconds_running)
+
+    assert [
+             %{
+               issue_id: ^issue_id,
+               identifier: "MT-201",
+               title: "Usage snapshot test",
+               session_id: "thread-usage-turn-usage",
+               codex_input_tokens: 12,
+               codex_output_tokens: 4,
+               codex_total_tokens: 16,
+               duration_seconds: duration_seconds,
+               decisions: [
+                 %{
+                   method: "codex/event/agent_reasoning",
+                   summary: decision_summary
+                 }
+               ]
+             }
+           ] = completed_state.worked_tasks
+
+    assert is_integer(duration_seconds)
+    assert decision_summary =~ "choose the review-state watcher boundary"
+
+    assert %{worked_tasks: [worked_task]} = GenServer.call(pid, :snapshot)
+    assert worked_task.identifier == "MT-201"
+    assert worked_task.codex_total_tokens == 16
+  end
+
+  test "orchestrator snapshot includes historical worked tasks" do
+    completed_at = DateTime.utc_now()
+
+    Application.put_env(:symphony_elixir, :worked_task_history_enabled, true)
+
+    Application.put_env(:symphony_elixir, :worked_task_history_loader, fn opts ->
+      assert opts == [limit: 100]
+
+      [
+        %{
+          task_id: "historical-task",
+          issue_id: "issue-history",
+          identifier: "MT-HIST",
+          title: "Historical task",
+          issue_url: nil,
+          state: nil,
+          session_id: "thread-history-turn-history",
+          worker_host: nil,
+          workspace_path: "/tmp/history",
+          started_at: DateTime.add(completed_at, -120, :second),
+          completed_at: completed_at,
+          duration_seconds: 120,
+          turn_count: 2,
+          codex_input_tokens: 40,
+          codex_output_tokens: 5,
+          codex_total_tokens: 45,
+          last_codex_event: :historical_session,
+          last_codex_message: nil,
+          decisions: [
+            %{at: completed_at, event: :agent_message, method: "codex/session", summary: "Historical decision"}
+          ]
+        }
+      ]
+    end)
+
+    orchestrator_name = Module.concat(__MODULE__, :HistoricalWorkedTasksOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    assert %{worked_tasks: [%{task_id: "historical-task", codex_total_tokens: 45}]} =
+             GenServer.call(pid, :snapshot)
   end
 
   test "orchestrator snapshot tracks turn completed usage when present" do
